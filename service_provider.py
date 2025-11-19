@@ -130,28 +130,25 @@ def _normalize_location(value: Optional[str]) -> Optional[str]:
 # ------------------------------
 # Brevo email sender
 # ------------------------------
-async def _send_brevo_email(to_email: str, subject: str, html_content: str):
-    headers = {
-        "api-key": BREVO_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {
-       "sender": {"name": "Smart Local Helpdesk", "email": "no-reply@brevo.com"},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": html_content
-    }
+def _send_brevo_email(to_email: str, subject: str, html_content: str):
+    configuration = sib_api_v3_sdk.Configuration()
+    configuration.api_key['api-key'] = BREVO_API_KEY
+    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+    email_data = sib_api_v3_sdk.SendSmtpEmail(
+        to=[{"email": to_email}],
+        sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
+        subject=subject,
+        html_content=html_content,
+        text_content="This is an automated email."
+    )
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.brevo.com/v3/smtp/email", json=payload, headers=headers) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logger.error("Brevo send failed: %s %s", resp.status, text)
-                    raise Exception(f"Brevo send failed: {resp.status} {text}")
-                return await resp.json()
-    except Exception as e:
-        logger.exception("Error sending Brevo email: %s", e)
-        raise
+        result = api_instance.send_transac_email(email_data)
+        return {"success": True, "brevo_id": result.message_id}
+    except ApiException as e:
+        raise RuntimeError(f"Brevo error: {e}")
+
 
 # ------------------------------
 # Update users when a new service is created
@@ -424,7 +421,7 @@ async def provider_send_otp(req: SendOtpRequest):
     subject = "Your Smart Local Helpdesk OTP"
     html = f"<p>Your verification code is <b>{otp}</b>. It is valid for {_otps_ttl_seconds // 60} minutes.</p>"
     try:
-        await _send_brevo_email(req.email, subject, html)
+          _send_brevo_email(req.email, subject, html)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to send OTP email: {e}")
     return {"success": True, "message": "OTP sent"}
@@ -533,7 +530,7 @@ async def provider_create_service(req: ServiceCreateRequest, background_tasks: B
         <p>Your service in {city_norm}, {state_norm} has been registered successfully.</p>
         <p>Store name created: <b>{search_store_name}</b></p>
         """
-        await _send_brevo_email(req.email, subject, html)
+            _send_brevo_email(req.email, subject, html)
     except Exception as e:
         await _db.events.insert_one({
             "type": "provider_welcome_email_failed",
@@ -653,7 +650,7 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
         <br>
         <p>Best regards,<br>Smart Local Helpdesk Team</p>
         """
-        await _send_brevo_email(user_email, subject, html)
+           _send_brevo_email(user_email, subject, html)
     except Exception as e:
         await _db.events.insert_one({
             "type": "ticket_completion_email_failed",
