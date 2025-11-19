@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+motor
+pymongo
+python-dotenv
+aiohttp
+apscheduler
+pydantic
+pydantic-email-validator
+google-genai
+python-multipart
+imagekitio
+python-dateutil
