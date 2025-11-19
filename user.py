@@ -499,6 +499,25 @@ async def create_ticket(req: CreateTicketRequest):
     from service_provider import _update_ticket_counts
     await _update_ticket_counts(req.provider_email)
 
+    # --- SEND EMAIL TO USER ---
+    try:
+        await _send_brevo_email(
+            req.user_email,
+            f"Ticket Created Successfully #{ticket_id}",
+            f"""
+            <p>Hello {req.user_name},</p>
+            <p>Your ticket has been created successfully.</p>
+            <p><b>Ticket ID:</b> {ticket_id}</p>
+            <p><b>Provider:</b> {req.provider_email}</p>
+            <p><b>Problem:</b> {req.problem}</p>
+            <p>We will notify you when the provider responds.</p>
+            <br>
+            <p>Smart Local Helpdesk</p>
+            """
+        )
+    except Exception as e:
+        logger.error("Failed to send ticket creation email: %s", e)
+
     return {
         "success": True,
         "message": "Ticket created",
