@@ -8,6 +8,8 @@ import string
 import asyncio
 import logging
 from datetime import datetime
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
 from typing import Optional, List, Dict, Any
 
 import aiohttp
@@ -87,27 +89,24 @@ def _normalize_location(value: str) -> str:
 # Email Sender (Brevo)
 # -----------------------------------------------------------
 
-async def _send_brevo_email(to_email: str, subject: str, html_content: str):
-    headers = {
-        "api-key": BREVO_API_KEY,
-        "Content-Type": "application/json"
-    }
+def _send_brevo_email(to_email: str, subject: str, html_content: str):
+    configuration = sib_api_v3_sdk.Configuration()
+    configuration.api_key['api-key'] = BREVO_API_KEY
+    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
 
-    payload = {
-        "sender": {"name": "Smart Local Helpdesk", "email": "no-reply@brevo.com"},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": html_content
-    }
+    email_data = sib_api_v3_sdk.SendSmtpEmail(
+        to=[{"email": to_email}],
+        sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
+        subject=subject,
+        html_content=html_content,
+        text_content="This is an automated email."
+    )
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://api.brevo.com/v3/smtp/email",
-                                json=payload, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                logger.error("Brevo failed: %s %s", resp.status, text)
-                raise RuntimeError("Failed sending email")
-            return await resp.json()
+    try:
+        result = api_instance.send_transac_email(email_data)
+        return {"success": True, "brevo_id": result.message_id}
+    except ApiException as e:
+        raise RuntimeError(f"Brevo error: {e}")
 
 
 # -----------------------------------------------------------
@@ -337,7 +336,7 @@ async def user_send_otp(req: UserSendOtp):
         upsert=True
     )
 
-    await _send_brevo_email(
+     _send_brevo_email(
         req.email,
         "Your Smart Local Helpdesk OTP",
         f"<p>Your OTP is <b>{otp}</b>. Valid for 5 mins.</p>"
