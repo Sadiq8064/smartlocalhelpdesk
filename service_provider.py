@@ -136,7 +136,7 @@ async def _send_brevo_email(to_email: str, subject: str, html_content: str):
         "Content-Type": "application/json"
     }
     payload = {
-        "sender": {"name": "Smart local help desk", "email": "noreply@smartlocal.example"},
+        "sender": {"name": "Smart local help desk", "email": "mrsadiq471@gmal.com"},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": html_content
