@@ -3,6 +3,7 @@ import os
 import asyncio
 from datetime import datetime
 from fastapi import FastAPI
+from smartsolve import init_smartsolve_routes
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -78,6 +79,7 @@ except Exception as e:
 init_service_routes(app, db)
 init_user_routes(app, db)
 init_delete_routes(app, db)
+init_smartsolve_routes(app, db)
 
 app.include_router(service_router, prefix="/providers", tags=["providers"])
 app.include_router(user_router, prefix="/users", tags=["users"])
