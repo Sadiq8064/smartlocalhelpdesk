@@ -6,7 +6,7 @@ python-dotenv
 aiohttp
 apscheduler
 pydantic
-pydantic-email-validator
+pydantic[email]
 google-genai
 python-multipart
 imagekitio
