@@ -24,11 +24,15 @@ from user import router as user_router, init_user_routes
 # ---------------------------------------------------------
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI")
+# Try MONGO_URL (Railway) first, then MONGO_URI (fallback)
+MONGO_URI = os.getenv("MONGO_URL") or os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "smart_local_db")
 
 if not MONGO_URI:
-    raise ValueError("MONGO_URI environment variable is required")
+    raise ValueError(
+        "MongoDB connection string not found. "
+        "Please set either MONGO_URL (Railway MongoDB) or MONGO_URI (MongoDB Atlas) environment variable."
+    )
 
 
 # ---------------------------------------------------------
@@ -41,10 +45,31 @@ logger = logging.getLogger("app")
 
 
 # ---------------------------------------------------------
-# MongoDB Setup
+# MongoDB Setup with SSL handling
 # ---------------------------------------------------------
-mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client[DB_NAME]
+try:
+    # Check if it's MongoDB Atlas (contains mongodb.net) and needs SSL handling
+    if "mongodb.net" in MONGO_URI:
+        mongo_client = AsyncIOMotorClient(
+            MONGO_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=True,  # Bypass SSL verification for Railway
+            retryWrites=True,
+            w="majority",
+            serverSelectionTimeoutMS=30000,
+            connectTimeoutMS=30000
+        )
+        logger.info("MongoDB Atlas connection with SSL configuration")
+    else:
+        # Railway MongoDB or local connection
+        mongo_client = AsyncIOMotorClient(MONGO_URI)
+        logger.info("Railway MongoDB connection established")
+    
+    db = mongo_client[DB_NAME]
+    
+except Exception as e:
+    logger.error(f"MongoDB connection failed: {e}")
+    raise
 
 
 # ---------------------------------------------------------
@@ -109,6 +134,14 @@ async def cleanup_expired_files():
 @app.on_event("startup")
 async def startup():
     logger.info("Starting Smart Local Helpdesk API...")
+
+    try:
+        # Test MongoDB connection
+        await db.command('ping')
+        logger.info("MongoDB connection test successful")
+    except Exception as e:
+        logger.error(f"MongoDB connection test failed: {e}")
+        # Don't crash the app, but log the error
 
     try:
         scheduler.remove_all_jobs()
