@@ -1,18 +1,18 @@
-# user.py — Production Ready (Hard-coded API keys as requested)
-
+# user.py — Production Ready (Brevo via sib_api_v3_sdk, non-blocking)
 import json
-import os  # Add this if not already imported
+import os
 import uuid
 import random
 import string
 import asyncio
 import logging
 from datetime import datetime
+from typing import Optional, List, Dict
+
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
-from typing import Optional, List, Dict, Any
 
-import aiohttp
+import aiohttp  # still used for GFAPI calls
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 
@@ -26,16 +26,14 @@ except Exception:
 
 
 # -----------------------------------------------------------
-# HARD-CODED API KEYS (as you requested)
+# HARD-CODED API KEYS (from env)
 # -----------------------------------------------------------
-
-# Replace with:
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 GKEY = os.getenv("GFAPI_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ASK_QUESTION_URL = os.getenv("ASK_QUESTION_URL")
 
-# Add validation after these lines:
+# Validate required envs
 if not BREVO_API_KEY:
     raise ValueError("BREVO_API_KEY environment variable is required")
 if not GKEY:
@@ -48,7 +46,6 @@ if not ASK_QUESTION_URL:
 OTP_TTL_SECONDS = 300  # 5 minutes
 
 # -----------------------------------------------------------
-
 router = APIRouter()
 _db = None
 logger = logging.getLogger("user_routes")
@@ -58,7 +55,6 @@ logging.basicConfig(level=logging.INFO)
 # -----------------------------------------------------------
 # Initialization
 # -----------------------------------------------------------
-
 def init_user_routes(app, db):
     global _db
     _db = db
@@ -67,7 +63,6 @@ def init_user_routes(app, db):
 # -----------------------------------------------------------
 # Utility Helpers
 # -----------------------------------------------------------
-
 def _generate_otp():
     return "".join(random.choices(string.digits, k=6))
 
@@ -86,33 +81,48 @@ def _normalize_location(value: str) -> str:
 
 
 # -----------------------------------------------------------
-# Email Sender (Brevo)
+# Email Sender (Brevo) — non-blocking wrapper around sib_api_v3_sdk
 # -----------------------------------------------------------
+async def _send_brevo_email(to_email: str, subject: str, html_content: str):
+    """
+    Sends an email using Brevo (sib_api_v3_sdk) without blocking the event loop.
+    Runs the blocking SDK call inside run_in_executor.
+    Returns parsed JSON-like response on success or raises RuntimeError on failure.
+    """
+    def _sync_send():
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key["api-key"] = BREVO_API_KEY
+        api_client = sib_api_v3_sdk.ApiClient(configuration)
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(api_client)
 
-def _send_brevo_email(to_email: str, subject: str, html_content: str):
-    configuration = sib_api_v3_sdk.Configuration()
-    configuration.api_key['api-key'] = BREVO_API_KEY
-    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+        email_data = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email}],
+            sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
+            subject=subject,
+            html_content=html_content,
+            text_content="This is an automated email from Smart Local Helpdesk."
+        )
 
-    email_data = sib_api_v3_sdk.SendSmtpEmail(
-        to=[{"email": to_email}],
-        sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
-        subject=subject,
-        html_content=html_content,
-        text_content="This is an automated email."
-    )
+        try:
+            resp = api_instance.send_transac_email(email_data)
+            # The SDK returns an object — convert minimal useful fields to dict
+            return {"success": True, "message_id": getattr(resp, "message_id", None), "raw": resp}
+        except ApiException as e:
+            # ApiException has body and status — include details
+            raise RuntimeError(f"Brevo ApiException: status={getattr(e, 'status', None)} body={getattr(e, 'body', None)}")
 
+    loop = asyncio.get_running_loop()
     try:
-        result = api_instance.send_transac_email(email_data)
-        return {"success": True, "brevo_id": result.message_id}
-    except ApiException as e:
-        raise RuntimeError(f"Brevo error: {e}")
+        result = await loop.run_in_executor(None, _sync_send)
+        return result
+    except Exception as e:
+        logger.exception("Brevo send failed: %s", e)
+        raise
 
 
 # -----------------------------------------------------------
 # Fetch services for a user's location
 # -----------------------------------------------------------
-
 async def _get_services_for_location(state: str, city: str) -> List[str]:
     state = _normalize_location(state)
     city = _normalize_location(city)
@@ -136,7 +146,6 @@ async def _get_services_for_location(state: str, city: str) -> List[str]:
 # -----------------------------------------------------------
 # Gemini (google-genai SDK) Helpers
 # -----------------------------------------------------------
-
 def _init_gemini_client_sync(api_key: str):
     if genai is None:
         raise RuntimeError("google-genai SDK not installed.")
@@ -192,7 +201,6 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str):
 
     try:
         client = await loop.run_in_executor(None, _init_gemini_client_sync, GEMINI_API_KEY)
-
         raw = await loop.run_in_executor(None, _call_gemini_sync, client, stores, question)
         if not raw:
             return {"stores": stores}
@@ -230,7 +238,6 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str):
 # -----------------------------------------------------------
 # GFAPI RAG Caller
 # -----------------------------------------------------------
-
 async def _call_rag_api(store: str, question: str):
     payload = {
         "api_key": GKEY,
@@ -255,7 +262,6 @@ async def _call_rag_api(store: str, question: str):
 # -----------------------------------------------------------
 # Conversation history storage
 # -----------------------------------------------------------
-
 async def _store_conversation(session_id: str, email: str, question: str, resp: Dict):
     try:
         await _db.conversations.insert_one({
@@ -272,7 +278,6 @@ async def _store_conversation(session_id: str, email: str, question: str, resp: 
 # -----------------------------------------------------------
 # Pydantic Models
 # -----------------------------------------------------------
-
 class UserSendOtp(BaseModel):
     email: EmailStr
     password: str
@@ -336,7 +341,8 @@ async def user_send_otp(req: UserSendOtp):
         upsert=True
     )
 
-     _send_brevo_email(
+    # send email (non-blocking)
+    await _send_brevo_email(
         req.email,
         "Your Smart Local Helpdesk OTP",
         f"<p>Your OTP is <b>{otp}</b>. Valid for 5 mins.</p>"
