@@ -1,4 +1,4 @@
-# service_provider.py — Production-ready, normalized locations, hard-coded API keys
+# service_provider.py — Production-ready, normalized locations, Brevo SDK integrated
 import os
 import random
 import string
@@ -25,6 +25,9 @@ except Exception:
     ImageKit = None
     UploadFileRequestOptions = None
 
+# Brevo SDK
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
 
 GKEY = os.getenv("GFAPI_KEY")
 UPLOAD_BASE_URL = os.getenv("GFAPI_BASE_URL")
@@ -128,27 +131,44 @@ def _normalize_location(value: Optional[str]) -> Optional[str]:
     return " ".join(part.capitalize() for part in value.strip().split())
 
 # ------------------------------
-# Brevo email sender
+# Brevo email sender (uses official SDK in a threadpool)
 # ------------------------------
-def _send_brevo_email(to_email: str, subject: str, html_content: str):
-    configuration = sib_api_v3_sdk.Configuration()
-    configuration.api_key['api-key'] = BREVO_API_KEY
-    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+async def _send_brevo_email(to_email: str, subject: str, html_content: str):
+    """
+    Send email using sib_api_v3_sdk. The SDK is blocking, so we run it inside
+    a threadpool using run_in_executor to avoid blocking the event loop.
+    Returns the Brevo message id on success.
+    Raises RuntimeError on failure.
+    """
+    def _send_sync():
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key['api-key'] = BREVO_API_KEY
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
 
-    email_data = sib_api_v3_sdk.SendSmtpEmail(
-        to=[{"email": to_email}],
-        sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
-        subject=subject,
-        html_content=html_content,
-        text_content="This is an automated email."
-    )
+        email_data = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email}],
+            sender={"name": "Smart Local Helpdesk", "email": "mrsadiq471@gmail.com"},
+            subject=subject,
+            html_content=html_content,
+            text_content="This is an automated email from Smart Local Helpdesk."
+        )
+        try:
+            result = api_instance.send_transac_email(email_data)
+            # result.message_id exists when successful
+            return {"success": True, "brevo_id": getattr(result, "message_id", None)}
+        except ApiException as e:
+            # ApiException has body/message
+            raise RuntimeError(f"Brevo ApiException: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Brevo send error: {e}")
 
+    loop = asyncio.get_running_loop()
     try:
-        result = api_instance.send_transac_email(email_data)
-        return {"success": True, "brevo_id": result.message_id}
-    except ApiException as e:
-        raise RuntimeError(f"Brevo error: {e}")
-
+        res = await loop.run_in_executor(None, _send_sync)
+        return res
+    except Exception as e:
+        logger.exception("Brevo send failed: %s", e)
+        raise
 
 # ------------------------------
 # Update users when a new service is created
@@ -421,7 +441,7 @@ async def provider_send_otp(req: SendOtpRequest):
     subject = "Your Smart Local Helpdesk OTP"
     html = f"<p>Your verification code is <b>{otp}</b>. It is valid for {_otps_ttl_seconds // 60} minutes.</p>"
     try:
-          _send_brevo_email(req.email, subject, html)
+        await _send_brevo_email(req.email, subject, html)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to send OTP email: {e}")
     return {"success": True, "message": "OTP sent"}
@@ -530,7 +550,7 @@ async def provider_create_service(req: ServiceCreateRequest, background_tasks: B
         <p>Your service in {city_norm}, {state_norm} has been registered successfully.</p>
         <p>Store name created: <b>{search_store_name}</b></p>
         """
-            _send_brevo_email(req.email, subject, html)
+        await _send_brevo_email(req.email, subject, html)
     except Exception as e:
         await _db.events.insert_one({
             "type": "provider_welcome_email_failed",
@@ -547,7 +567,6 @@ async def provider_create_service(req: ServiceCreateRequest, background_tasks: B
         "message": "Service created successfully",
         "search_store": service_doc["search_store"]
     }
-
 
 @router.post("/update_service")
 async def provider_update_service(req: ServiceUpdateRequest):
@@ -622,6 +641,7 @@ async def submit_ticket_solution(req: TicketSolutionRequest, background_tasks: B
 
     await _update_ticket_counts(req.provider_email)
 
+    # schedule background email (async function is fine for BackgroundTasks)
     background_tasks.add_task(
         _send_ticket_completion_email,
         ticket.get("user_email"),
@@ -650,7 +670,7 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
         <br>
         <p>Best regards,<br>Smart Local Helpdesk Team</p>
         """
-           _send_brevo_email(user_email, subject, html)
+        await _send_brevo_email(user_email, subject, html)
     except Exception as e:
         await _db.events.insert_one({
             "type": "ticket_completion_email_failed",
@@ -813,7 +833,6 @@ async def upload_files(
             "imagekit_used": bool(imagekit)
         }
     }
-
 
 @router.delete("/delete_file")
 async def delete_file(req: DeleteFileRequest):
