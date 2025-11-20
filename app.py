@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from fastapi import FastAPI
 
-# 🔥 Import SmartSolve module
+# 🔥 SmartSolve module
 from smartsolve import init_smartsolve_routes
 
 # MongoDB
@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 import logging
 
 # ---------------------------------------------------------
-# Import your modules
+# Import modules
 # ---------------------------------------------------------
 from delete import init_delete_routes
 
@@ -33,25 +33,22 @@ from user import (
     init_user_routes
 )
 
-# 🔥 Import Social Media Module (your new ML + posts system)
+# 🔥 Social Media ML module
 from social import (
-    router as social_router,
-    init_social_routes
+    init_social_routes   # NOTE: router included inside this initializer
 )
 
 # ---------------------------------------------------------
-# Load environment variables
+# Load env variables
 # ---------------------------------------------------------
 load_dotenv()
 
-# Try MONGO_URL (Railway) first, then MONGO_URI (fallback)
 MONGO_URI = os.getenv("MONGO_URL") or os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "smart_local_db")
 
 if not MONGO_URI:
     raise ValueError(
-        "MongoDB connection string not found. "
-        "Please set either MONGO_URL (Railway MongoDB) or MONGO_URI (MongoDB Atlas)."
+        "MongoDB connection string missing. Set MONGO_URL (Railway) or MONGO_URI (Atlas)."
     )
 
 # ---------------------------------------------------------
@@ -76,7 +73,7 @@ try:
             serverSelectionTimeoutMS=30000,
             connectTimeoutMS=30000
         )
-        logger.info("Connected to MongoDB Atlas (SSL bypass mode).")
+        logger.info("Connected to MongoDB Atlas (TLS bypass).")
     else:
         mongo_client = AsyncIOMotorClient(MONGO_URI)
         logger.info("Connected to Railway MongoDB.")
@@ -88,14 +85,14 @@ except Exception as e:
     raise
 
 # ---------------------------------------------------------
-# Initialize All Routes
+# Initialize Routes (Attach DB)
 # ---------------------------------------------------------
 init_service_routes(app, db)
 init_user_routes(app, db)
 init_delete_routes(app, db)
 init_smartsolve_routes(app, db)
 
-# 🔥 Initialize Social Module (sets DB & starts model warmup)
+# 🔥 Initialize social module (loads model, binds DB, includes router)
 init_social_routes(app, db)
 
 # ---------------------------------------------------------
@@ -103,9 +100,7 @@ init_social_routes(app, db)
 # ---------------------------------------------------------
 app.include_router(service_router, prefix="/providers", tags=["providers"])
 app.include_router(user_router, prefix="/users", tags=["users"])
-
-# 🔥 Social router (main feature)
-app.include_router(social_router, prefix="/social", tags=["social"])
+# ❗ DO NOT include social_router again — it is inside init_social_routes()
 
 # ---------------------------------------------------------
 # Scheduler
@@ -119,34 +114,43 @@ async def reset_daily_ticket_counts():
             {},
             {"$set": {"ticket_counts.today_ticket_count": 0}}
         )
-        logger.info(f"[RESET] Reset ticket counts for {result.modified_count} services")
+        logger.info(
+            f"[RESET] Reset ticket counts for {result.modified_count} services"
+        )
     except Exception as e:
-        logger.exception(f"Error resetting counts: {e}")
+        logger.exception(f"Error resetting ticket counts: {e}")
 
 async def cleanup_expired_files():
     """Delete expired uploaded files automatically."""
     try:
         now = datetime.utcnow()
-        expired_files = await db.uploads.find({"delete_at": {"$lte": now}}).to_list(length=None)
+        expired_files = await db.uploads.find(
+            {"delete_at": {"$lte": now}}
+        ).to_list(length=None)
 
         for file_doc in expired_files:
             try:
-                await _delete_file_from_gfapi(file_doc["store_name"], file_doc["document_id"])
+                await _delete_file_from_gfapi(
+                    file_doc["store_name"],
+                    file_doc["document_id"]
+                )
             except Exception as e:
-                logger.warning(f"GFAPI deletion failed for {file_doc.get('filename')}: {e}")
+                logger.warning(
+                    f"GFAPI deletion failed for {file_doc.get('filename')}: {e}"
+                )
 
             await db.uploads.delete_one({"_id": file_doc["_id"]})
             logger.info(f"[CLEANUP] Deleted expired file: {file_doc.get('filename')}")
 
     except Exception as e:
-        logger.exception(f"Cleanup error: {e}")
+        logger.exception(f"Error during expired file cleanup: {e}")
 
 # ---------------------------------------------------------
-# Startup Events
+# Startup Event
 # ---------------------------------------------------------
 @app.on_event("startup")
 async def startup():
-    logger.info("🚀 Starting Smart Local Helpdesk API")
+    logger.info("🚀 Starting Smart Local Helpdesk API...")
 
     try:
         await db.command("ping")
@@ -156,24 +160,33 @@ async def startup():
 
     try:
         scheduler.remove_all_jobs()
-    except:
+    except Exception:
         pass
 
-    scheduler.add_job(reset_daily_ticket_counts, CronTrigger(hour=23, minute=59), id="reset_daily_ticket_counts")
-    scheduler.add_job(cleanup_expired_files, CronTrigger(hour=0, minute=0), id="cleanup_expired_files")
+    scheduler.add_job(
+        reset_daily_ticket_counts,
+        CronTrigger(hour=23, minute=59),
+        id="reset_ticket_counts"
+    )
+
+    scheduler.add_job(
+        cleanup_expired_files,
+        CronTrigger(hour=0, minute=0),
+        id="cleanup_expired"
+    )
 
     scheduler.start()
-    logger.info("Scheduler started.")
+    logger.info("Scheduler started successfully.")
 
 # ---------------------------------------------------------
-# Shutdown Events
+# Shutdown Event
 # ---------------------------------------------------------
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Shutting down API...")
     try:
         scheduler.shutdown()
-    except:
+    except Exception:
         pass
     mongo_client.close()
     logger.info("Shutdown complete.")
