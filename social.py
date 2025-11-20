@@ -1,8 +1,15 @@
-# social.py — PART 1 of 3
+# social.py
 """
 Social media module with in-process TensorFlow prediction.
 
-Part 1: imports, config, model download & loader, utilities.
+Features:
+- /social/posts/create  (accepts file or image_url, will run TF model if available)
+- /social/providers/{email}/posts
+- /social/feed  (personalized feed by lat/lon/state/city)
+- comments/likes/push endpoints
+- Model auto-download from Google Drive (if ML_MODEL_PATH not present and MODEL_GDRIVE_ID provided)
+- Model loaded once (lazy) in a threadpool to avoid blocking event loop
+- Helper init function: init_social_routes(app, db)
 """
 
 import os
@@ -26,7 +33,7 @@ import requests
 logger = logging.getLogger("social")
 logging.basicConfig(level=logging.INFO)
 
-# Collections used by the module
+# ---------------- Config & Constants ----------------
 USERS_COLLECTION = "users"
 POSTS_COLLECTION = "posts"
 SERVICES_COLLECTION = "services"
@@ -49,17 +56,15 @@ IMAGEKIT_PRIVATE_KEY = os.getenv("IMAGEKIT_PRIVATE_KEY")
 IMAGEKIT_URL_ENDPOINT = os.getenv("IMAGEKIT_URL_ENDPOINT")
 
 # Model storage path (Railway volume)
-MODEL_DIR = "/mnt/data/models"
+# Use environment override if present, otherwise default to /mnt/data/models
+MODEL_DIR = os.getenv("MODEL_DIR", "/mnt/data/models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Drive IDs (from user)
-MODEL_GDRIVE_ID_KERAS = "1GWw7-JpXXo72yo43jhUTuogrSGHCY_tv"
-MODEL_GDRIVE_ID_H5 = "1t_CSDo1cg05obFMxlRrs8dWWdI830hS4"
+# Model file path and GDrive id (expect ML_MODEL_PATH or MODEL_GDRIVE_ID in .env)
+ML_MODEL_PATH = os.path.join(MODEL_DIR, "model.keras")
+MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID") or "1GWw7-JpXXo72yo43jhUTuogrSGHCY_tv"  # fallback to the KERAS id you provided
 
-KERAS_MODEL_PATH = os.path.join(MODEL_DIR, "model.keras")
-H5_MODEL_PATH = os.path.join(MODEL_DIR, "model.h5")
-
-# Model input size and classes (adjust as needed)
+# Model input size and classes
 IMG_SIZE = (299, 299)
 CLASS_NAMES = [
     'Damaged_highway', 'buses', 'drainage', 'dustbin',
@@ -68,7 +73,7 @@ CLASS_NAMES = [
     'street_light_working', 'traffic_signals', 'trash'
 ]
 
-# Module state
+# ---------------- Module state ----------------
 router = APIRouter()
 _db = None
 
@@ -77,9 +82,7 @@ _tf = None         # tensorflow module reference
 _model_lock = asyncio.Lock()
 _model_loaded_event = asyncio.Event()
 
-# -------------------------
-# Utilities
-# -------------------------
+# ---------------- Utilities ----------------
 def haversine_meters(lat1, lon1, lat2, lon2):
     R = 6371000.0
     phi1 = math.radians(lat1)
@@ -94,9 +97,7 @@ def normalize_department_for_compare(dept: Optional[str]) -> Optional[str]:
         return None
     return dept.strip().replace(" ", "_").lower()
 
-# -------------------------
-# Google Drive download helper
-# -------------------------
+# ---------------- Google Drive download helper ----------------
 def _gdrive_download_url(file_id: str):
     return "https://docs.google.com/uc?export=download&id=" + file_id
 
@@ -141,9 +142,7 @@ def download_file_from_gdrive(file_id: str, dest_path: str, chunk_size: int = 32
                 total += len(chunk)
     return total
 
-# -------------------------
-# Model loading & prediction
-# -------------------------
+# ---------------- Model loading & prediction ----------------
 def _preprocess_image_bytes_sync(img_bytes: bytes):
     img = Image.open(BytesIO(img_bytes)).convert("RGB")
     img = img.resize(IMG_SIZE)
@@ -154,7 +153,7 @@ def _preprocess_image_bytes_sync(img_bytes: bytes):
 async def ensure_model_loaded():
     """
     Ensure model file exists and model loaded into memory.
-    Downloads from Drive if missing (tries KERAS first, then H5).
+    Downloads from Drive if missing (tries KERAS model path).
     """
     global _model, _tf
     if _model is not None:
@@ -164,36 +163,18 @@ async def ensure_model_loaded():
         if _model is not None:
             return
 
-        # Download if missing
         try:
-            if not os.path.exists(KERAS_MODEL_PATH) and not os.path.exists(H5_MODEL_PATH):
-                # attempt keras first
-                try:
-                    if MODEL_GDRIVE_ID_KERAS:
-                        logger.info("Downloading KERAS model to %s", KERAS_MODEL_PATH)
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, download_file_from_gdrive, MODEL_GDRIVE_ID_KERAS, KERAS_MODEL_PATH
-                        )
-                        logger.info("KERAS model downloaded.")
-                except Exception as e:
-                    logger.warning("KERAS download failed: %s", e)
-
-                # if keras not present, try h5
-                if not os.path.exists(KERAS_MODEL_PATH) and MODEL_GDRIVE_ID_H5:
-                    try:
-                        logger.info("Downloading H5 model to %s", H5_MODEL_PATH)
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, download_file_from_gdrive, MODEL_GDRIVE_ID_H5, H5_MODEL_PATH
-                        )
-                        logger.info("H5 model downloaded.")
-                    except Exception as e:
-                        logger.warning("H5 download failed: %s", e)
-
-            # If still missing, just set event and return (endpoints may accept predicted_class)
-            if not os.path.exists(KERAS_MODEL_PATH) and not os.path.exists(H5_MODEL_PATH):
-                logger.warning("No model file found after download attempts. Model will be unavailable.")
-                _model_loaded_event.set()
-                return
+            # Download if missing
+            if not os.path.exists(ML_MODEL_PATH):
+                if MODEL_GDRIVE_ID:
+                    logger.info("Model not found on disk; downloading from Google Drive (%s) to %s", MODEL_GDRIVE_ID, ML_MODEL_PATH)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, download_file_from_gdrive, MODEL_GDRIVE_ID, ML_MODEL_PATH)
+                    logger.info("Model downloaded to %s", ML_MODEL_PATH)
+                else:
+                    logger.warning("No MODEL_GDRIVE_ID configured; model won't be available.")
+                    _model_loaded_event.set()
+                    return
 
             # Load TF model in executor (avoid blocking event loop)
             loop = asyncio.get_running_loop()
@@ -201,16 +182,16 @@ async def ensure_model_loaded():
                 import tensorflow as tf_local
                 nonlocal _tf
                 _tf = tf_local
-                # prefer keras file
-                if os.path.exists(KERAS_MODEL_PATH):
-                    return tf_local.keras.models.load_model(KERAS_MODEL_PATH)
-                return tf_local.keras.models.load_model(H5_MODEL_PATH)
+                m = tf_local.keras.models.load_model(ML_MODEL_PATH)
+                return m
 
             _model = await loop.run_in_executor(None, _sync_load)
-            logger.info("Model loaded into memory from disk.")
+            logger.info("Model loaded into memory from %s", ML_MODEL_PATH)
         except Exception as e:
             logger.exception("Failed to ensure/load model: %s", e)
             _model = None
+            # still set the event so awaiting tasks don't hang
+            _model_loaded_event.set()
             raise
         finally:
             _model_loaded_event.set()
@@ -239,12 +220,8 @@ async def predict_image_from_bytes(img_bytes: bytes):
     else:
         cls = str(idx)
     return cls, conf, raw
-# social.py — PART 2 of 3
-"""
-Part 2: Post creation, duplicate detection, provider endpoints, feed.
-"""
 
-# Duplicate detection helpers (uses optional similarity API)
+# ---------------- Duplicate detection ----------------
 def _call_caption_similarity_api_sync(text1: str, text2: str) -> Optional[float]:
     if not SIMILARITY_API_BASE:
         return None
@@ -339,9 +316,7 @@ async def _find_duplicate(user_doc: dict, predicted_class: str, lat: float, lon:
 
     return False, None, best_score if best_score >= 0 else None
 
-# -------------------------
-# Pydantic models
-# -------------------------
+# ---------------- Pydantic models ----------------
 class CreatePostResponse(BaseModel):
     success: bool
     message: str
@@ -354,9 +329,7 @@ class CommentCreateRequest(BaseModel):
     post_id: str
     text: str
 
-# -------------------------
-# Create Post endpoint
-# -------------------------
+# ---------------- Core endpoints ----------------
 @router.post("/posts/create", response_model=CreatePostResponse)
 async def create_post(
     email: str = Form(...),
@@ -368,8 +341,8 @@ async def create_post(
     predicted_class: Optional[str] = Form(None),
     predicted_confidence: Optional[float] = Form(None)
 ):
-    users_col = _db[USERS_COLLECTION]
     posts_col = _db[POSTS_COLLECTION]
+    users_col = _db[USERS_COLLECTION]
 
     user_doc = await users_col.find_one({"email": email})
     if not user_doc:
@@ -440,7 +413,6 @@ async def create_post(
                     return {"url": raw.get("url")}
         except Exception:
             pass
-        # fallback
         if hasattr(res, "url"):
             return {"url": res.url}
         try:
@@ -488,9 +460,7 @@ async def create_post(
     await posts_col.insert_one(post_doc)
     return CreatePostResponse(success=True, message="Post created", post_id=post_id)
 
-# -------------------------
-# Provider endpoint
-# -------------------------
+# ---------------- Provider endpoint ----------------
 @router.get("/providers/{email}/posts")
 async def provider_get_posts(email: str, limit: int = 50, skip: int = 0):
     providers_col = _db[PROVIDERS_COLLECTION]
@@ -523,9 +493,7 @@ async def provider_get_posts(email: str, limit: int = 50, skip: int = 0):
     for d in docs:
         if normalize_department_for_compare(d.get("department")) == prov_dept_norm:
             doc = dict(d)
-            if isinstance(doc.get("created_at"), str):
-                pass
-            elif isinstance(doc.get("created_at"), datetime):
+            if isinstance(doc.get("created_at"), datetime):
                 doc["created_at"] = doc["created_at"].isoformat()
             if "_id" in doc:
                 doc["_id"] = str(doc["_id"])
@@ -539,9 +507,7 @@ async def provider_get_posts(email: str, limit: int = 50, skip: int = 0):
         "posts": filtered
     })
 
-# -------------------------
-# Feed API
-# -------------------------
+# ---------------- Feed API ----------------
 @router.post("/feed")
 async def get_personalized_feed(
     latitude: float = Form(...),
@@ -584,7 +550,7 @@ async def get_personalized_feed(
     within = [e for e in enriched if e["distance_m"] <= priority_m]
     beyond = [e for e in enriched if e["distance_m"] > priority_m]
 
-    # sort rules
+    # sort rules: nearest first, then higher pushes, then recent
     within.sort(key=lambda x: (x["distance_m"], -x["push_count"], -(x["created_at"].timestamp() if x["created_at"] else 0)))
     beyond.sort(key=lambda x: (x["distance_m"], -(x["created_at"].timestamp() if x["created_at"] else 0)))
 
@@ -615,12 +581,8 @@ async def get_personalized_feed(
 
     feed = [_serialize(e) for e in sliced]
     return {"success": True, "count": len(feed), "feed": feed}
-# social.py — PART 3 of 3
-"""
-Part 3: comments, likes, extra endpoints (search, admin, reports).
-"""
 
-# Comments / likes / push endpoints
+# ---------------- Comments / likes / push endpoints ----------------
 @router.post("/comments/create")
 async def create_comment(req: CommentCreateRequest):
     posts_col = _db[POSTS_COLLECTION]
@@ -733,9 +695,7 @@ async def delete_post(email: str = Form(...), post_id: str = Form(...)):
         raise HTTPException(status_code=404, detail="Post not found or not owned by user")
     return {"success": True, "message": "Post deleted"}
 
-# -------------------------
-# EXTRA ADMIN / SEARCH APIs
-# -------------------------
+# ---------------- EXTRA ADMIN / SEARCH APIs ----------------
 @router.get("/posts/all")
 async def get_all_posts(limit: int = 200, skip: int = 0):
     posts_col = _db[POSTS_COLLECTION]
@@ -803,4 +763,44 @@ async def get_posts_by_location(
 @router.get("/posts/class/{predicted_class}")
 async def get_posts_by_class(predicted_class: str, limit: int = 100):
     posts_col = _db[POSTS_COLLECTION]
-    docs = await posts_col.find({"predicted_class"
+    docs = await posts_col.find({"predicted_class": predicted_class}).limit(limit).to_list(length=None)
+    out = []
+    for d in docs:
+        doc = dict(d)
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+        if isinstance(doc.get("created_at"), datetime):
+            doc["created_at"] = doc["created_at"].isoformat()
+        out.append(doc)
+    return {"success": True, "count": len(out), "posts": out}
+
+# ---------------- Module init ----------------
+def init_social_routes(app, db, prefix: str = "/social"):
+    """
+    Initialize the social routes.
+
+    Parameters:
+    - app: FastAPI instance
+    - db: AsyncIOMotorDatabase instance (db = client[DB_NAME])
+    - prefix: route prefix (default '/social')
+
+    This sets internal _db, mounts router at `prefix`, and
+    schedules a background model warmup (non-blocking).
+    """
+    global _db
+    _db = db
+    app.include_router(router, prefix=prefix, tags=["social"])
+    # start background model warmup but don't block startup
+    try:
+        asyncio.create_task(_background_model_warmup())
+    except Exception:
+        # if called outside of running loop, swallow (app startup will still call warmup)
+        pass
+
+async def _background_model_warmup():
+    try:
+        await ensure_model_loaded()
+    except Exception as e:
+        logger.warning("Background model warmup failed: %s", e)
+
+# End of social.py
