@@ -197,9 +197,6 @@ async def ensure_model_loaded():
             _model_loaded_event.set()
 
 async def predict_image_from_bytes(img_bytes: bytes):
-    """
-    Returns (predicted_class, confidence, raw_preds_list)
-    """
     await ensure_model_loaded()
     global _model, _tf
     if _model is None:
@@ -209,17 +206,21 @@ async def predict_image_from_bytes(img_bytes: bytes):
     arr = await loop.run_in_executor(None, _preprocess_image_bytes_sync, img_bytes)
 
     def _sync_predict(a):
-        preds = _model.predict(a, verbose=0).flatten()
+        # 🔥 prevent recursive graph execution
+        _tf.config.run_functions_eagerly(True)
+
+        # 🔥 run model in eager mode
+        preds = _model(a, training=False).numpy().flatten()
+
         idx = int(np.argmax(preds))
         conf = float(preds[idx])
         return idx, conf, preds.tolist()
 
     idx, conf, raw = await loop.run_in_executor(None, _sync_predict, arr)
-    if 0 <= idx < len(CLASS_NAMES):
-        cls = CLASS_NAMES[idx]
-    else:
-        cls = str(idx)
+
+    cls = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else str(idx)
     return cls, conf, raw
+
 
 # ---------------- Duplicate detection ----------------
 def _call_caption_similarity_api_sync(text1: str, text2: str) -> Optional[float]:
