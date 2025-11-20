@@ -800,26 +800,32 @@ async def ask_question(req: AskQuestionRequest):
 
 
 # ----------------- FETCH USER CONVERSATIONS -----------------
-@router.get("/{email}/conversations")
-async def get_user_conversations(email: str, session_id: Optional[str] = None):
-    if not await _db.users.find_one({"email": email}):
-        raise HTTPException(404, "User not found")
+@router.get("/{email:path}/conversations")
+async def get_user_conversations(email: str):
+    # 1️⃣ Fetch user
+    user = await _db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    query = {"user_email": email}
-    if session_id:
-        query["session_id"] = session_id
+    # 2️⃣ Fetch conversation docs
+    convos = await _db.conversations.find(
+        {"user_email": email}
+    ).sort("created_at", -1).to_list(length=None)
 
-    convs = await _db.conversations.find(query).sort("created_at").to_list(None)
+    # 3️⃣ Convert ObjectId → string
+    cleaned = []
+    for c in convos:
+        c["_id"] = str(c["_id"])
+        # If conversation has messages
+        if "messages" in c:
+            for m in c["messages"]:
+                if "_id" in m:
+                    m["_id"] = str(m["_id"])
+        cleaned.append(c)
 
-    sessions = {}
-    for c in convs:
-        sid = c["session_id"]
-        if sid not in sessions:
-            sessions[sid] = []
-        sessions[sid].append(c)
-
+    # 4️⃣ Return perfectly JSON serializable output
     return {
         "success": True,
-        "sessions": sessions,
-        "total_sessions": len(sessions)
+        "count": len(cleaned),
+        "conversations": cleaned
     }
