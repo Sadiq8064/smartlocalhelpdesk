@@ -1,13 +1,15 @@
 # social.py
 """
-Social media module with optional in-process TensorFlow prediction.
+Social media module using Gemini for image-to-department classification (no TensorFlow).
 
 Key behavior:
-- Lazy-downloads model from Google Drive (if ML_MODEL_PATH missing and MODEL_GDRIVE_ID provided)
-- Loads TF model inside run_in_executor (non-blocking)
-- Prediction runs inside run_in_executor
-- Robust error handling: if TensorFlow import fails with recursion or similar, an informative error is raised
-- Compatible with Python 3.10 + tensorflow==2.15 (recommended)
+- Uses Gemini (model hard-coded to "gemini-2.5-flash") to classify an uploaded image into
+  exactly one department (from the services collection) or "none".
+- Sends a strict prompt + base64 JPEG image to Gemini and expects EXACT JSON:
+    {"department": "<department-name-or-none>"}
+  with no extra text.
+- All other endpoints and logic (uploads, duplicate detection, feed, etc.) remain the same.
+- Gemini API key is read from the environment variable GEMINI_API_KEY.
 """
 
 import os
@@ -27,6 +29,10 @@ from io import BytesIO
 from PIL import Image
 import numpy as np
 import requests
+
+# Gemini client
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger("social")
 logging.basicConfig(level=logging.INFO)
@@ -53,31 +59,17 @@ IMAGEKIT_PUBLIC_KEY = os.getenv("IMAGEKIT_PUBLIC_KEY")
 IMAGEKIT_PRIVATE_KEY = os.getenv("IMAGEKIT_PRIVATE_KEY")
 IMAGEKIT_URL_ENDPOINT = os.getenv("IMAGEKIT_URL_ENDPOINT")
 
-# Model storage path (Railway volume)
+# Gemini config (hard-coded model, API key from env)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Model storage path placeholder (kept for compatibility; not used for TF)
 MODEL_DIR = os.getenv("MODEL_DIR", "/mnt/data/models")
 os.makedirs(MODEL_DIR, exist_ok=True)
-
-# Model file path and GDrive id (expect ML_MODEL_PATH or MODEL_GDRIVE_ID in .env)
-ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", os.path.join(MODEL_DIR, "model.keras"))
-MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID", None)
-
-# Model input size and classes
-IMG_SIZE = (299, 299)
-CLASS_NAMES = [
-    'Damaged_highway', 'buses', 'drainage', 'dustbin',
-    'electric_pole', 'fallen_tree', 'fire', 'footpath',
-    'pothole_image_data', 'street_light_not_working',
-    'street_light_working', 'traffic_signals', 'trash'
-]
 
 # ---------------- Module state ----------------
 router = APIRouter()
 _db = None
-
-_model = None      # loaded TF model
-_tf = None         # tensorflow module reference
-_model_lock = asyncio.Lock()
-_model_loaded_event = asyncio.Event()
 
 # ---------------- Utilities ----------------
 def haversine_meters(lat1, lon1, lat2, lon2):
@@ -94,157 +86,124 @@ def normalize_department_for_compare(dept: Optional[str]) -> Optional[str]:
         return None
     return dept.strip().replace(" ", "_").lower()
 
-# ---------------- Google Drive download helper ----------------
-def _gdrive_download_url(file_id: str):
-    return "https://docs.google.com/uc?export=download&id=" + file_id
-
-def download_file_from_gdrive(file_id: str, dest_path: str, chunk_size: int = 32768):
+# ---------------- Gemini helper ----------------
+def _make_gemini_prompt(departments: List[str], b64_image: str) -> str:
     """
-    Synchronous download from Google Drive using confirm token flow.
-    Intended to be called via run_in_executor.
+    Build a strict prompt asking Gemini to return EXACT JSON:
+    {"department":"<one of the departments or none>"}
     """
-    session = requests.Session()
-    url = _gdrive_download_url(file_id)
+    # clean department names and join with commas in a single-line list for clarity
+    clean_depts = [d.strip() for d in departments if d and isinstance(d, str)]
+    # Build a short instruction. We DO NOT include long lists printed as classes in prompt.
+    # We'll pass the department list explicitly.
+    dept_list_text = ", ".join(clean_depts) if clean_depts else ""
+    prompt = (
+        "You are an image-to-department classifier. "
+        "You will be given a base64-encoded JPEG image and a comma-separated list of department names.\n\n"
+        f"Departments available: {dept_list_text}\n\n"
+        "Task: Inspect the image and choose EXACTLY ONE department name from the list that this image belongs to. "
+        "If the image does NOT match any department, return `none`.\n\n"
+        "Return ONLY valid JSON in the EXACT format below and NOTHING else (no explanation, no whitespace padding):\n"
+        '{"department":"<one-department-name-or-none>"}\n\n'
+        "Important: department name must exactly match one of the provided department names (case-sensitive match is not required). "
+        "If uncertain, pick the best match or return \"none\". Do NOT include any other keys or fields.\n\n"
+        "Base64Image:\n" + b64_image + "\n\n"
+    )
+    return prompt
 
-    resp = session.get(url, stream=True)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to start Google Drive download: HTTP {resp.status_code}")
-
-    # Confirm token (large files) flow
-    token = None
-    for k, v in session.cookies.items():
-        if k.startswith("download_warning"):
-            token = v
-            break
-
-    if token:
-        resp = session.get(url, params={"confirm": token}, stream=True)
-    else:
-        try:
-            content = resp.content.decode("utf-8", errors="ignore")
-            import re
-            m = re.search(r"confirm=([0-9A-Za-z_-]+)&", content)
-            if m:
-                token = m.group(1)
-                resp = session.get(url, params={"confirm": token}, stream=True)
-        except Exception:
-            pass
-
-    total = 0
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=chunk_size):
-            if chunk:
-                f.write(chunk)
-                total += len(chunk)
-    return total
-
-# ---------------- Model loading & prediction ----------------
-def _preprocess_image_bytes_sync(img_bytes: bytes):
-    img = Image.open(BytesIO(img_bytes)).convert("RGB")
-    img = img.resize(IMG_SIZE)
-    arr = np.array(img).astype("float32") / 255.0
-    arr = np.expand_dims(arr, 0)
-    return arr
-
-async def ensure_model_loaded():
+async def _classify_image_with_gemini(img_bytes: bytes, departments: List[str]) -> str:
     """
-    Ensure model file exists and model loaded into memory.
-    Downloads from Drive if missing (tries ML_MODEL_PATH or MODEL_GDRIVE_ID).
-    Loads TensorFlow inside run_in_executor to avoid blocking.
-    Raises RuntimeError with helpful message if import/load fails.
+    Calls Gemini to classify image into one department (or 'none').
+    Returns the department string (or 'none').
+    Raises RuntimeError on Gemini failures.
     """
-    global _model, _tf
-    if _model is not None:
-        return
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set in environment")
 
-    async with _model_lock:
-        if _model is not None:
-            return
+    # convert to base64 (JPEG)
+    try:
+        # ensure it's JPEG bytes: if input is other format PIL will convert
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        jpeg_bytes = buf.getvalue()
+    except Exception as e:
+        raise RuntimeError(f"Failed to normalize image to JPEG: {e}") from e
 
-        try:
-            # Download if missing
-            if not os.path.exists(ML_MODEL_PATH):
-                if MODEL_GDRIVE_ID:
-                    logger.info("Model not found on disk; downloading from Google Drive (%s) to %s", MODEL_GDRIVE_ID, ML_MODEL_PATH)
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, download_file_from_gdrive, MODEL_GDRIVE_ID, ML_MODEL_PATH)
-                    logger.info("Model downloaded to %s", ML_MODEL_PATH)
-                else:
-                    logger.info("No model on disk and no MODEL_GDRIVE_ID configured; model won't be available.")
-                    # set event so callers don't hang — but don't set _model
-                    _model_loaded_event.set()
-                    return
+    b64_image = base64.b64encode(jpeg_bytes).decode("ascii")
 
-            # Load TF model in executor (avoid blocking event loop)
-            loop = asyncio.get_running_loop()
-            def _sync_load():
-                # Import tensorflow inside executor (so top-level import doesn't crash startup)
-                try:
-                    import tensorflow as tf_local
-                except RecursionError as re:
-                    # Re-raise with context to make logs actionable
-                    raise RecursionError("TensorFlow import triggered recursion — ensure running on Python 3.10 and tensorflow==2.15") from re
-                except Exception as e:
-                    raise RuntimeError(f"TensorFlow import failed: {e}") from e
-
-                # store TF module reference
-                  # this binds name in outer scope of _sync_load; Python scoping requires nonlocal
-                # NOTE: we can't directly set outer _tf from inside nested function in older pythons without nonlocal,
-                # so return both tf and model, then assign outside.
-                m = tf_local.keras.models.load_model(ML_MODEL_PATH)
-                return tf_local, m
-
-            tf_module, model_obj = await loop.run_in_executor(None, _sync_load)
-            _tf = tf_module
-            _model = model_obj
-            logger.info("Model loaded into memory from %s", ML_MODEL_PATH)
-
-        except RecursionError as re:
-            logger.exception("TensorFlow recursion error during load: %s", re)
-            _model = None
-            # ensure event is set so awaiting clients won't hang
-            _model_loaded_event.set()
-            # Give actionable message
-            raise RuntimeError(
-                "TensorFlow import failed with recursion. This happens on Python 3.11 in some environments. "
-                "Switch your Railway runtime to Python 3.10 and install tensorflow==2.15, or convert to ONNX/TFLite."
-            ) from re
-
-        except Exception as e:
-            logger.exception("Failed to ensure/load model: %s", e)
-            _model = None
-            _model_loaded_event.set()
-            raise RuntimeError(f"Failed to load model: {e}") from e
-
-        finally:
-            # always set event so callers do not block forever
-            _model_loaded_event.set()
-
-async def predict_image_from_bytes(img_bytes: bytes):
-    """
-    Returns (predicted_class, confidence, raw_preds_list)
-    Runs preprocessing and model.predict inside executor to avoid blocking the loop.
-    """
-    await ensure_model_loaded()
-    global _model, _tf
-    if _model is None:
-        raise RuntimeError("Model not available (not loaded)")
+    prompt = _make_gemini_prompt(departments, b64_image)
 
     loop = asyncio.get_running_loop()
-    arr = await loop.run_in_executor(None, _preprocess_image_bytes_sync, img_bytes)
 
-    def _sync_predict(a):
-        # Use model.predict (safe) inside executor
-        preds = _model.predict(a, verbose=0).flatten()
-        idx = int(np.argmax(preds))
-        conf = float(preds[idx])
-        return idx, conf, preds.tolist()
+    def _sync_call():
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=256)
+            )
+            # response.text should contain the assistant's output
+            return response.text
+        except Exception as e:
+            raise RuntimeError(f"Gemini request failed: {e}") from e
 
-    idx, conf, raw = await loop.run_in_executor(None, _sync_predict, arr)
-    cls = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else str(idx)
-    return cls, conf, raw
+    try:
+        result_text = await loop.run_in_executor(None, _sync_call)
+    except Exception as e:
+        logger.exception("Gemini classification failed: %s", e)
+        raise RuntimeError(f"Gemini classification failed: {e}") from e
 
-# ---------------- Duplicate detection ----------------
+    # Parse result_text: expect exact JSON like {"department":"name"} with no extra text
+    result_text_stripped = result_text.strip()
+    try:
+        parsed = None
+        # Try simple JSON parse
+        import json
+        parsed = json.loads(result_text_stripped)
+        if isinstance(parsed, dict) and "department" in parsed:
+            dept = parsed["department"]
+            # Normalize to None or exact string (if user wanted exact DB department, we will attempt best match)
+            if isinstance(dept, str):
+                dept_clean = dept.strip()
+                if dept_clean.lower() == "none":
+                    return "none"
+                # Attempt to find the exact department from provided list (case-insensitive match)
+                for d in departments:
+                    if d and d.strip().lower() == dept_clean.lower():
+                        return d  # return DB department exact string
+                # If not matched, still return the raw string (caller may accept it)
+                return dept_clean
+        # If JSON not as expected, fall through to fallback parsing below
+    except Exception:
+        # not valid JSON — fall through
+        pass
+
+    # Fallback heuristics: try to extract department value using simple parsing
+    # Look for pattern like {"department":"..."} anywhere in the text
+    import re, json
+    m = re.search(r'\"department\"\s*:\s*\"([^\"]+)\"', result_text_stripped)
+    if m:
+        dept_raw = m.group(1).strip()
+        if dept_raw.lower() == "none":
+            return "none"
+        for d in departments:
+            if d and d.strip().lower() == dept_raw.lower():
+                return d
+        return dept_raw
+
+    # If still nothing, try to find any token from departments in the text
+    txt_lower = result_text_stripped.lower()
+    for d in departments:
+        if d and d.strip().lower() in txt_lower:
+            return d
+
+    # Last resort: return 'none'
+    logger.warning("Gemini returned unexpected output while classifying image: %r", result_text_stripped)
+    return "none"
+
+# ---------------- Duplicate detection helpers (unchanged) ----------------
 def _call_caption_similarity_api_sync(text1: str, text2: str) -> Optional[float]:
     if not SIMILARITY_API_BASE:
         return None
@@ -253,7 +212,6 @@ def _call_caption_similarity_api_sync(text1: str, text2: str) -> Optional[float]
         if r.status_code != 200:
             return None
         j = r.json()
-        # try to extract first numeric value
         if isinstance(j, dict):
             for v in j.values():
                 if isinstance(v, (int, float)):
@@ -352,7 +310,7 @@ class CommentCreateRequest(BaseModel):
     post_id: str
     text: str
 
-# ---------------- Core endpoints ----------------
+# ---------------- Core endpoints (mostly unchanged) ----------------
 @router.post("/posts/create", response_model=CreatePostResponse)
 async def create_post(
     email: str = Form(...),
@@ -366,6 +324,7 @@ async def create_post(
 ):
     posts_col = _db[POSTS_COLLECTION]
     users_col = _db[USERS_COLLECTION]
+    services_col = _db[SERVICES_COLLECTION]
 
     user_doc = await users_col.find_one({"email": email})
     if not user_doc:
@@ -393,12 +352,19 @@ async def create_post(
     # Run prediction if not provided
     if not predicted_class:
         try:
-            # ensure model is available (this will raise helpful error if TF import recursion occurs)
-            await ensure_model_loaded()
-            if _model is None:
-                raise HTTPException(status_code=400, detail="Model not available on server; please provide predicted_class")
-            predicted_class, conf, raw = await predict_image_from_bytes(img_bytes)
-            predicted_confidence = float(conf)
+            # Fetch departments from services collection
+            departments = await services_col.distinct("department")
+            # classify with Gemini
+            predicted_department = await _classify_image_with_gemini(img_bytes, departments)
+            if not predicted_department:
+                predicted_department = "none"
+            if predicted_department == "none":
+                # We keep the old predicted_class semantics: a label (we will store "none" or leave to client)
+                predicted_class = "none"
+                predicted_confidence = 0.0
+            else:
+                predicted_class = predicted_department
+                predicted_confidence = None  # Gemini prompt does not return confidence; leave as None
         except HTTPException:
             raise
         except Exception as e:
@@ -429,7 +395,6 @@ async def create_post(
         ik = ImageKit(public_key=IMAGEKIT_PUBLIC_KEY, private_key=IMAGEKIT_PRIVATE_KEY, url_endpoint=IMAGEKIT_URL_ENDPOINT)
         b64 = base64.b64encode(bytes_data).decode()
         res = ik.upload_file(file=b64, file_name=filename)
-        # extract URL robustly
         try:
             if getattr(res, "response_metadata", None):
                 raw = getattr(res.response_metadata, "raw", None)
@@ -811,14 +776,6 @@ def init_social_routes(app, db, prefix: str = "/social"):
     global _db
     _db = db
     app.include_router(router, prefix=prefix, tags=["social"])
-    # start background model warmup but don't block startup
-    try:
-        asyncio.create_task(_background_model_warmup())
-    except Exception:
-        pass
+    # No TensorFlow warmup. Gemini calls are done per-request.
 
-async def _background_model_warmup():
-    try:
-        await ensure_model_loaded()
-    except Exception as e:
-        logger.warning("Background model warmup failed: %s", e)
+# End of file
