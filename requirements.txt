@@ -14,10 +14,7 @@ python-dateutil
 sib_api_v3_sdk
 requests
 
-# ML + Social Media Dependencies
-tensorflow==2.15.0
-Pillow
-numpy
+
 
 # --- REQUIRED FOR SMARTSOLVE ---
 sentence-transformers
