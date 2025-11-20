@@ -411,6 +411,52 @@ async def create_feedback(req: CreateFeedbackRequest):
         "feedback_id": str(result.inserted_id)
     }
 
+# -----------------------------------------------------------
+# GET ALL FEEDBACK FOR A PROVIDER
+# -----------------------------------------------------------
+@router.get("/feedback")
+async def provider_feedback(provider_email: str):
+    # Check if provider exists
+    provider = await _db.providers.find_one({"email": provider_email})
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+
+    provider_name = provider["name"]
+    department_name = provider["department_name"]
+    state = provider["state"]
+    city = provider["city"]
+
+    # Fetch feedback from feedback collection
+    feedbacks = await _db.feedback.find({
+        "provider_email": provider_email
+    }).sort("created_at", -1).to_list(None)
+
+    total = len(feedbacks)
+    avg_rating = round(
+        (sum(f["rating"] for f in feedbacks) / total) if total > 0 else 0, 2
+    )
+
+    return {
+        "success": True,
+        "provider_name": provider_name,
+        "department_name": department_name,
+        "state": state,
+        "city": city,
+        "total_feedbacks": total,
+        "average_rating": avg_rating,
+        "feedbacks": [
+            {
+                "feedback_id": str(f["_id"]),
+                "user_email": f["user_email"],
+                "user_name": f["user_name"],
+                "rating": f["rating"],
+                "feedback_text": f["feedback_text"],
+                "created_at": f["created_at"],
+                "updated_at": f.get("updated_at")
+            }
+            for f in feedbacks
+        ]
+    }
 
 # -----------------------------------------------------------
 # UPDATE FEEDBACK
