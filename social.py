@@ -1,15 +1,13 @@
 # social.py
 """
-Social media module with in-process TensorFlow prediction.
+Social media module with optional in-process TensorFlow prediction.
 
-Features:
-- /social/posts/create  (accepts file or image_url, will run TF model if available)
-- /social/providers/{email}/posts
-- /social/feed  (personalized feed by lat/lon/state/city)
-- comments/likes/push endpoints
-- Model auto-download from Google Drive (if ML_MODEL_PATH not present and MODEL_GDRIVE_ID provided)
-- Model loaded once (lazy) in a threadpool to avoid blocking event loop
-- Helper init function: init_social_routes(app, db)
+Key behavior:
+- Lazy-downloads model from Google Drive (if ML_MODEL_PATH missing and MODEL_GDRIVE_ID provided)
+- Loads TF model inside run_in_executor (non-blocking)
+- Prediction runs inside run_in_executor
+- Robust error handling: if TensorFlow import fails with recursion or similar, an informative error is raised
+- Compatible with Python 3.10 + tensorflow==2.15 (recommended)
 """
 
 import os
@@ -56,13 +54,12 @@ IMAGEKIT_PRIVATE_KEY = os.getenv("IMAGEKIT_PRIVATE_KEY")
 IMAGEKIT_URL_ENDPOINT = os.getenv("IMAGEKIT_URL_ENDPOINT")
 
 # Model storage path (Railway volume)
-# Use environment override if present, otherwise default to /mnt/data/models
 MODEL_DIR = os.getenv("MODEL_DIR", "/mnt/data/models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Model file path and GDrive id (expect ML_MODEL_PATH or MODEL_GDRIVE_ID in .env)
-ML_MODEL_PATH = os.path.join(MODEL_DIR, "model.keras")
-MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID") or "1GWw7-JpXXo72yo43jhUTuogrSGHCY_tv"  # fallback to the KERAS id you provided
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", os.path.join(MODEL_DIR, "model.keras"))
+MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID", None)
 
 # Model input size and classes
 IMG_SIZE = (299, 299)
@@ -113,7 +110,7 @@ def download_file_from_gdrive(file_id: str, dest_path: str, chunk_size: int = 32
     if resp.status_code != 200:
         raise RuntimeError(f"Failed to start Google Drive download: HTTP {resp.status_code}")
 
-    # Check cookie token
+    # Confirm token (large files) flow
     token = None
     for k, v in session.cookies.items():
         if k.startswith("download_warning"):
@@ -123,7 +120,6 @@ def download_file_from_gdrive(file_id: str, dest_path: str, chunk_size: int = 32
     if token:
         resp = session.get(url, params={"confirm": token}, stream=True)
     else:
-        # try to parse confirm token inside HTML for large files
         try:
             content = resp.content.decode("utf-8", errors="ignore")
             import re
@@ -153,7 +149,9 @@ def _preprocess_image_bytes_sync(img_bytes: bytes):
 async def ensure_model_loaded():
     """
     Ensure model file exists and model loaded into memory.
-    Downloads from Drive if missing (tries KERAS model path).
+    Downloads from Drive if missing (tries ML_MODEL_PATH or MODEL_GDRIVE_ID).
+    Loads TensorFlow inside run_in_executor to avoid blocking.
+    Raises RuntimeError with helpful message if import/load fails.
     """
     global _model, _tf
     if _model is not None:
@@ -172,55 +170,79 @@ async def ensure_model_loaded():
                     await loop.run_in_executor(None, download_file_from_gdrive, MODEL_GDRIVE_ID, ML_MODEL_PATH)
                     logger.info("Model downloaded to %s", ML_MODEL_PATH)
                 else:
-                    logger.warning("No MODEL_GDRIVE_ID configured; model won't be available.")
+                    logger.info("No model on disk and no MODEL_GDRIVE_ID configured; model won't be available.")
+                    # set event so callers don't hang — but don't set _model
                     _model_loaded_event.set()
                     return
 
             # Load TF model in executor (avoid blocking event loop)
             loop = asyncio.get_running_loop()
             def _sync_load():
-                import tensorflow as tf_local
-                global _tf
-                _tf = tf_local
-                m = tf_local.keras.models.load_model(ML_MODEL_PATH)
-                return m
+                # Import tensorflow inside executor (so top-level import doesn't crash startup)
+                try:
+                    import tensorflow as tf_local
+                except RecursionError as re:
+                    # Re-raise with context to make logs actionable
+                    raise RecursionError("TensorFlow import triggered recursion — ensure running on Python 3.10 and tensorflow==2.15") from re
+                except Exception as e:
+                    raise RuntimeError(f"TensorFlow import failed: {e}") from e
 
-            _model = await loop.run_in_executor(None, _sync_load)
+                # store TF module reference
+                nonlocal _tf  # this binds name in outer scope of _sync_load; Python scoping requires nonlocal
+                # NOTE: we can't directly set outer _tf from inside nested function in older pythons without nonlocal,
+                # so return both tf and model, then assign outside.
+                m = tf_local.keras.models.load_model(ML_MODEL_PATH)
+                return tf_local, m
+
+            tf_module, model_obj = await loop.run_in_executor(None, _sync_load)
+            _tf = tf_module
+            _model = model_obj
             logger.info("Model loaded into memory from %s", ML_MODEL_PATH)
+
+        except RecursionError as re:
+            logger.exception("TensorFlow recursion error during load: %s", re)
+            _model = None
+            # ensure event is set so awaiting clients won't hang
+            _model_loaded_event.set()
+            # Give actionable message
+            raise RuntimeError(
+                "TensorFlow import failed with recursion. This happens on Python 3.11 in some environments. "
+                "Switch your Railway runtime to Python 3.10 and install tensorflow==2.15, or convert to ONNX/TFLite."
+            ) from re
+
         except Exception as e:
             logger.exception("Failed to ensure/load model: %s", e)
             _model = None
-            # still set the event so awaiting tasks don't hang
             _model_loaded_event.set()
-            raise
+            raise RuntimeError(f"Failed to load model: {e}") from e
+
         finally:
+            # always set event so callers do not block forever
             _model_loaded_event.set()
 
 async def predict_image_from_bytes(img_bytes: bytes):
+    """
+    Returns (predicted_class, confidence, raw_preds_list)
+    Runs preprocessing and model.predict inside executor to avoid blocking the loop.
+    """
     await ensure_model_loaded()
     global _model, _tf
     if _model is None:
-        raise RuntimeError("Model not available")
+        raise RuntimeError("Model not available (not loaded)")
 
     loop = asyncio.get_running_loop()
     arr = await loop.run_in_executor(None, _preprocess_image_bytes_sync, img_bytes)
 
     def _sync_predict(a):
-        # 🔥 prevent recursive graph execution
-        _tf.config.run_functions_eagerly(True)
-
-        # 🔥 run model in eager mode
-        preds = _model(a, training=False).numpy().flatten()
-
+        # Use model.predict (safe) inside executor
+        preds = _model.predict(a, verbose=0).flatten()
         idx = int(np.argmax(preds))
         conf = float(preds[idx])
         return idx, conf, preds.tolist()
 
     idx, conf, raw = await loop.run_in_executor(None, _sync_predict, arr)
-
     cls = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else str(idx)
     return cls, conf, raw
-
 
 # ---------------- Duplicate detection ----------------
 def _call_caption_similarity_api_sync(text1: str, text2: str) -> Optional[float]:
@@ -371,6 +393,7 @@ async def create_post(
     # Run prediction if not provided
     if not predicted_class:
         try:
+            # ensure model is available (this will raise helpful error if TF import recursion occurs)
             await ensure_model_loaded()
             if _model is None:
                 raise HTTPException(status_code=400, detail="Model not available on server; please provide predicted_class")
@@ -784,9 +807,6 @@ def init_social_routes(app, db, prefix: str = "/social"):
     - app: FastAPI instance
     - db: AsyncIOMotorDatabase instance (db = client[DB_NAME])
     - prefix: route prefix (default '/social')
-
-    This sets internal _db, mounts router at `prefix`, and
-    schedules a background model warmup (non-blocking).
     """
     global _db
     _db = db
@@ -795,7 +815,6 @@ def init_social_routes(app, db, prefix: str = "/social"):
     try:
         asyncio.create_task(_background_model_warmup())
     except Exception:
-        # if called outside of running loop, swallow (app startup will still call warmup)
         pass
 
 async def _background_model_warmup():
@@ -803,5 +822,3 @@ async def _background_model_warmup():
         await ensure_model_loaded()
     except Exception as e:
         logger.warning("Background model warmup failed: %s", e)
-
-# End of social.py
