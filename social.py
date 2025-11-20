@@ -188,7 +188,7 @@ async def ensure_model_loaded():
                     raise RuntimeError(f"TensorFlow import failed: {e}") from e
 
                 # store TF module reference
-                nonlocal _tf  # this binds name in outer scope of _sync_load; Python scoping requires nonlocal
+                  # this binds name in outer scope of _sync_load; Python scoping requires nonlocal
                 # NOTE: we can't directly set outer _tf from inside nested function in older pythons without nonlocal,
                 # so return both tf and model, then assign outside.
                 m = tf_local.keras.models.load_model(ML_MODEL_PATH)
