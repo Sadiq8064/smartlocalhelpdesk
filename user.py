@@ -8,6 +8,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict
+from bson import ObjectId
 
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
@@ -313,8 +314,23 @@ class AskQuestionRequest(BaseModel):
     email: EmailStr
     question: str
     session_id: Optional[str] = None
+class CreateFeedbackRequest(BaseModel):
+    user_email: EmailStr
+    provider_email: EmailStr
+    rating: int = Field(..., ge=1, le=5)
+    feedback_text: Optional[str] = None
 
 
+class UpdateFeedbackRequest(BaseModel):
+    user_email: EmailStr
+    feedback_id: str
+    rating: Optional[int] = Field(None, ge=1, le=5)
+    feedback_text: Optional[str] = None
+
+
+class DeleteFeedbackRequest(BaseModel):
+    user_email: EmailStr
+    feedback_id: str
 # -----------------------------------------------------------
 #  ENDPOINTS
 # -----------------------------------------------------------
@@ -350,6 +366,111 @@ async def user_send_otp(req: UserSendOtp):
 
     return {"success": True, "message": "OTP sent"}
 
+# -----------------------------------------------------------
+# CREATE FEEDBACK
+# -----------------------------------------------------------
+@router.post("/feedback/create")
+async def create_feedback(req: CreateFeedbackRequest):
+    # Fetch user
+    user = await _db.users.find_one({"email": req.user_email})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Fetch provider
+    provider = await _db.providers.find_one({"email": req.provider_email})
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+
+    # Fetch state & city from USER (not from request)
+    state = user["state"]
+    city = user["city"]
+
+    # Get provider details
+    department_name = provider["department_name"]
+    provider_name = provider["name"]
+
+    feedback_doc = {
+        "user_email": req.user_email,
+        "user_name": user["name"],
+        "state": state,
+        "city": city,
+        "provider_email": req.provider_email,
+        "provider_name": provider_name,
+        "department_name": department_name,
+        "rating": req.rating,
+        "feedback_text": req.feedback_text or "",
+        "created_at": datetime.utcnow(),
+        "updated_at": None
+    }
+
+    result = await _db.feedback.insert_one(feedback_doc)
+
+    return {
+        "success": True,
+        "message": "Feedback created successfully",
+        "feedback_id": str(result.inserted_id)
+    }
+
+
+# -----------------------------------------------------------
+# UPDATE FEEDBACK
+# -----------------------------------------------------------
+@router.post("/feedback/update")
+async def update_feedback(req: UpdateFeedbackRequest):
+    # Convert id
+    try:
+        fid = ObjectId(req.feedback_id)
+    except:
+        raise HTTPException(400, "Invalid feedback ID")
+
+    fb = await _db.feedback.find_one({"_id": fid})
+    if not fb:
+        raise HTTPException(404, "Feedback not found")
+
+    # Ensure user owns the feedback
+    if fb["user_email"] != req.user_email:
+        raise HTTPException(403, "You cannot edit someone else's feedback")
+
+    updates = {}
+    if req.rating is not None:
+        updates["rating"] = req.rating
+    if req.feedback_text is not None:
+        updates["feedback_text"] = req.feedback_text
+
+    updates["updated_at"] = datetime.utcnow()
+
+    await _db.feedback.update_one({"_id": fid}, {"$set": updates})
+
+    return {
+        "success": True,
+        "message": "Feedback updated successfully"
+    }
+
+
+# -----------------------------------------------------------
+# DELETE FEEDBACK
+# -----------------------------------------------------------
+@router.post("/feedback/delete")
+async def delete_feedback(req: DeleteFeedbackRequest):
+    try:
+        fid = ObjectId(req.feedback_id)
+    except:
+        raise HTTPException(400, "Invalid feedback ID")
+
+    fb = await _db.feedback.find_one({"_id": fid})
+    if not fb:
+        raise HTTPException(404, "Feedback not found")
+
+    # Ensure user owns the feedback
+    if fb["user_email"] != req.user_email:
+        raise HTTPException(403, "You cannot delete someone else's feedback")
+
+    await _db.feedback.delete_one({"_id": fid})
+
+    return {
+        "success": True,
+        "message": "Feedback deleted successfully"
+    }
 
 # ----------------- VERIFY OTP -----------------
 @router.post("/verify_otp")
