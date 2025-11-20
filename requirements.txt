@@ -12,10 +12,15 @@ python-multipart
 imagekitio
 python-dateutil
 sib_api_v3_sdk
+requests
+
+# ML + Social Media Dependencies
+tensorflow-cpu==2.15.0
+Pillow
+numpy
 
 # --- REQUIRED FOR SMARTSOLVE ---
 sentence-transformers
-numpy
 scikit-learn
 hdbscan
 torch
