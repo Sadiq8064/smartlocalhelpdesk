@@ -180,7 +180,7 @@ async def ensure_model_loaded():
             loop = asyncio.get_running_loop()
             def _sync_load():
                 import tensorflow as tf_local
-                nonlocal _tf
+                global _tf
                 _tf = tf_local
                 m = tf_local.keras.models.load_model(ML_MODEL_PATH)
                 return m
