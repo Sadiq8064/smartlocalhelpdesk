@@ -4,6 +4,9 @@ import asyncio
 from datetime import datetime
 from fastapi import FastAPI
 
+# ⭐ ADD THIS IMPORT
+from fastapi.middleware.cors import CORSMiddleware
+
 # 🔥 SmartSolve module
 from smartsolve import init_smartsolve_routes
 
@@ -58,6 +61,18 @@ app = FastAPI(title="Smart Local Helpdesk API")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
+
+# ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
+#                   ADD CORS HERE
+# ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # Allow all domains (frontend testing)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
 
 # ---------------------------------------------------------
 # MongoDB Connection
