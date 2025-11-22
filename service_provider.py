@@ -769,7 +769,7 @@ async def provider_live_questions_sse(
             # Count answered questions live
             answered_count = await _db.questions_asked.count_documents({
                 "provider_email": provider_email,
-                "answered": True
+                
             })
 
             # Stream new questions
