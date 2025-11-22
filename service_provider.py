@@ -724,7 +724,7 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
 # ---------------------------------------------------------
 # API 1: LIVE STREAM OF LATEST QUESTIONS (for websocket/polling)
 # ---------------------------------------------------------
-@router.get("/provider/{provider_email}/questions/live")
+@router.get("/providers/{provider_email}/questions/live")
 async def provider_live_questions(
     provider_email: str,
     since: Optional[str] = None,
@@ -771,7 +771,7 @@ async def provider_live_questions(
 # ---------------------------------------------------------
 # API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
 # ---------------------------------------------------------
-@router.get("/provider/{provider_email}/questions/filter")
+@router.get("/providers/{provider_email}/questions/filter")
 async def provider_filtered_questions(
     provider_email: str,
     filter_by: Optional[str] = None
