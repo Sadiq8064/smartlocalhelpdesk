@@ -751,7 +751,7 @@ async def provider_live_questions_sse(
 
             # Stop loop if client disconnects
             if await request.is_disconnected():
-                print("SSE disconnected")
+                print("SSE client disconnected")
                 break
 
             query = {"provider_email": provider_email}
@@ -772,12 +772,20 @@ async def provider_live_questions_sse(
                 "answered": True
             })
 
-            # If new questions arrived → stream them
+            # Stream new questions
             if new_questions:
-                last_ts = new_questions[0]["asked_at"]  # update cursor
+                last_ts = new_questions[0]["asked_at"]
 
                 for q in new_questions:
                     q["_id"] = str(q["_id"])
+
+                    # Convert datetime → string
+                    if isinstance(q.get("asked_at"), datetime):
+                        q["asked_at"] = q["asked_at"].isoformat()
+
+                    # Convert completed timestamp if exists
+                    if isinstance(q.get("answered_at"), datetime):
+                        q["answered_at"] = q["answered_at"].isoformat()
 
                     payload = {
                         "type": "new_question",
@@ -787,10 +795,11 @@ async def provider_live_questions_sse(
 
                     yield f"data: {json.dumps(payload)}\n\n"
 
-            # Send heartbeat + answered count every second
+            # Heartbeat event every second
             heartbeat = {
                 "type": "heartbeat",
-                "answered_count": answered_count
+                "answered_count": answered_count,
+                "time": datetime.utcnow().isoformat()
             }
 
             yield f"data: {json.dumps(heartbeat)}\n\n"
