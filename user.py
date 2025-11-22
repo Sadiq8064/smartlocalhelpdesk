@@ -747,7 +747,21 @@ async def ask_question(req: AskQuestionRequest):
 
     # --- Predict store relevance using Gemini ---
     gemini_result = await _call_gemini_for_store_selection(stores, req.question)
-    selected_stores = gemini_result.get("stores") or stores
+    selected_stores = gemini_result.get("stores", [])
+
+# If Gemini finds no matching store → return immediately
+if not selected_stores:
+    resp = {
+        "success": True,
+        "session_id": session_id,
+        "response": "Sorry, no available service can answer this question.",
+        "stores_used": [],
+        "sources": [],
+        "detailed": []
+    }
+    await _store_conversation(session_id, req.email, req.question, resp)
+    return resp
+
     split_q = gemini_result.get("split_questions", {})
 
     final_answers = []
