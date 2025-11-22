@@ -734,9 +734,9 @@ async def provider_live_questions_sse(
     provider_email: str
 ):
     """
-    SSE stream of:
+    SSE stream of ONLY:
     - new questions asked
-    - answered questions count live
+    - heartbeat timestamp
     """
 
     # Check provider exists
@@ -749,56 +749,42 @@ async def provider_live_questions_sse(
 
         while True:
 
-            # Stop loop if client disconnects
+            # Stop if client disconnects
             if await request.is_disconnected():
                 print("SSE client disconnected")
                 break
 
             query = {"provider_email": provider_email}
 
-            # Only new questions after last timestamp
             if last_ts:
                 query["asked_at"] = {"$gt": last_ts}
 
-            # Fetch new questions
+            # Fetch latest questions for provider
             new_questions = await _db.questions_asked \
                 .find(query) \
                 .sort("asked_at", -1) \
                 .to_list(length=None)
 
-            # Count answered questions live
-            answered_count = await _db.questions_asked.count_documents({
-                "provider_email": provider_email,
-                
-            })
-
-            # Stream new questions
+            # Stream new questions only
             if new_questions:
                 last_ts = new_questions[0]["asked_at"]
 
                 for q in new_questions:
                     q["_id"] = str(q["_id"])
 
-                    # Convert datetime → string
                     if isinstance(q.get("asked_at"), datetime):
                         q["asked_at"] = q["asked_at"].isoformat()
 
-                    # Convert completed timestamp if exists
-                    if isinstance(q.get("answered_at"), datetime):
-                        q["answered_at"] = q["answered_at"].isoformat()
-
                     payload = {
                         "type": "new_question",
-                        "question": q,
-                        "answered_count": answered_count
+                        "question": q
                     }
 
                     yield f"data: {json.dumps(payload)}\n\n"
 
-            # Heartbeat event every second
+            # Heartbeat with timestamp only
             heartbeat = {
                 "type": "heartbeat",
-                "answered_count": answered_count,
                 "time": datetime.utcnow().isoformat()
             }
 
@@ -807,7 +793,6 @@ async def provider_live_questions_sse(
             await asyncio.sleep(1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
 
 # ---------------------------------------------------------
 # API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
