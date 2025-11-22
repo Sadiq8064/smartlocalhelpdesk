@@ -16,6 +16,10 @@ import shutil
 from pathlib import Path
 import base64
 import logging
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
 
 # ImageKit SDK is synchronous; we'll call it in a threadpool
 try:
@@ -724,49 +728,77 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
 # ---------------------------------------------------------
 # API 1: LIVE STREAM OF LATEST QUESTIONS (for websocket/polling)
 # ---------------------------------------------------------
-@router.get("/{provider_email}/questions/live")
-async def provider_live_questions(
-    provider_email: str,
-    since: Optional[str] = None,
-    limit: int = 30
+@router.get("/{provider_email}/questions/sse")
+async def provider_live_questions_sse(
+    request: Request,
+    provider_email: str
 ):
+    """
+    SSE stream of:
+    - new questions asked
+    - answered questions count live
+    """
+
     # Check provider exists
     provider = await _db.providers.find_one({"email": provider_email})
     if not provider:
         raise HTTPException(404, "Provider not found")
 
-    query = {"provider_email": provider_email}
+    async def event_generator():
+        last_ts = None
 
-    # If "since" timestamp is provided → return only NEW questions
-    if since:
-        try:
-            since_dt = datetime.fromisoformat(since)
-            query["asked_at"] = {"$gt": since_dt}
-        except Exception:
-            raise HTTPException(
-                400,
-                "Invalid since timestamp. Must be ISO, e.g. 2025-11-23T14:22:10"
-            )
+        while True:
 
-    logs = await _db.questions_asked.find(query) \
-        .sort("asked_at", -1) \
-        .limit(limit) \
-        .to_list(None)
+            # Stop loop if client disconnects
+            if await request.is_disconnected():
+                print("SSE disconnected")
+                break
 
-    # Clean ObjectIds
-    for log in logs:
-        log["_id"] = str(log["_id"])
+            query = {"provider_email": provider_email}
 
-    # Provide latest timestamp to help client maintain a cursor
-    latest_ts = logs[0]["asked_at"] if logs else None
+            # Only new questions after last timestamp
+            if last_ts:
+                query["asked_at"] = {"$gt": last_ts}
 
-    return {
-        "success": True,
-        "provider_email": provider_email,
-        "count": len(logs),
-        "latest_timestamp": latest_ts,
-        "questions": logs
-    }
+            # Fetch new questions
+            new_questions = await _db.questions_asked \
+                .find(query) \
+                .sort("asked_at", -1) \
+                .to_list(length=None)
+
+            # Count answered questions live
+            answered_count = await _db.questions_asked.count_documents({
+                "provider_email": provider_email,
+                "answered": True
+            })
+
+            # If new questions arrived → stream them
+            if new_questions:
+                last_ts = new_questions[0]["asked_at"]  # update cursor
+
+                for q in new_questions:
+                    q["_id"] = str(q["_id"])
+
+                    payload = {
+                        "type": "new_question",
+                        "question": q,
+                        "answered_count": answered_count
+                    }
+
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+            # Send heartbeat + answered count every second
+            heartbeat = {
+                "type": "heartbeat",
+                "answered_count": answered_count
+            }
+
+            yield f"data: {json.dumps(heartbeat)}\n\n"
+
+            await asyncio.sleep(1)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 # ---------------------------------------------------------
 # API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
