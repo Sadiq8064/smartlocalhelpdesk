@@ -20,6 +20,8 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 import json
 import asyncio
+from smartsolve import cluster_pending as smartsolve_cluster_pending
+
 
 # ImageKit SDK is synchronous; we'll call it in a threadpool
 try:
@@ -725,15 +727,10 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
 
 
 
-# ---------------------------------------------------------
-# API 1: LIVE STREAM OF LATEST QUESTIONS (for websocket/polling)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# API: COMBINED LIVE QUESTIONS + ANALYTICS SSE
-# ---------------------------------------------------------
+
 # ---------------------------------------------------------
 # API: COMBINED LIVE QUESTIONS + ANALYTICS + FEEDBACK
-#       + UPLOADS (LIVE) + TICKETS SSE (FINAL VERSION)
+#       + UPLOADS (LIVE) + TICKETS + SOCIAL POSTS + SMARTSOLVE SSE
 # ---------------------------------------------------------
 @router.get("/{provider_email}/questions/sse")
 async def provider_live_questions_sse(
@@ -741,7 +738,11 @@ async def provider_live_questions_sse(
     provider_email: str
 ):
     from bson import json_util
+    import asyncio
+    from datetime import datetime, timedelta
+    import json
 
+    # You already have global _db set via init_service_provider_routes(...)
     provider = await _db.providers.find_one({"email": provider_email})
     if not provider:
         raise HTTPException(404, "Provider not found")
@@ -755,12 +756,20 @@ async def provider_live_questions_sse(
     prov_dept = service["department"]
     prov_dept_norm = prov_dept.strip().replace(" ", "_").lower()
 
+    posts_col = _db["posts"]  # social posts collection
+
     async def event_generator():
-        last_ts = datetime.utcnow()
-        last_analytics = None
-        last_feedback_time = None
-        last_ticket_time = None
-        uploads_state = {}
+        # import SmartSolve endpoint as a function
+        from smartsolve import cluster_pending as smartsolve_cluster_pending
+
+        # ---------- STATE MARKERS ----------
+        last_ts = datetime.utcnow()      # questions AFTER this time only
+        last_analytics = None           # last analytics snapshot
+        last_feedback_time = None       # last feedback datetime
+        last_ticket_time = None         # last ticket change datetime
+        uploads_state = {}              # filename -> type
+        posts_state = set()             # post_id set
+        last_smartsolve_pending_count = None  # last pending count used for SmartSolve
 
         # ---------------------------------------------------------
         # 1️⃣ INITIAL ANALYTICS (FIRST EVENT)
@@ -807,16 +816,17 @@ async def provider_live_questions_sse(
 
         last_analytics = current_analytics.copy()
 
+        # initial analytics event
         yield f"data: {json.dumps({'type': 'initial_analytics', 'analytics': current_analytics})}\n\n"
 
         # ---------------------------------------------------------
-        # 2️⃣ INITIAL UPLOADS
+        # 2️⃣ INITIAL UPLOADS (SNAPSHOT)
         # ---------------------------------------------------------
         uploads = await _db.uploads.find({
             "provider_email": provider_email
         }).sort("created_at", -1).to_list(None)
 
-        grouped = {
+        grouped_uploads = {
             "notice": [],
             "frequently_asked": [],
             "important_data": []
@@ -831,16 +841,19 @@ async def provider_live_questions_sse(
             if not file_name:
                 continue
 
-            entry = {"file_name": file_name, "uploaded_at": created_at_iso}
+            entry = {
+                "file_name": file_name,
+                "uploaded_at": created_at_iso
+            }
 
-            if upload_type in grouped:
-                grouped[upload_type].append(entry)
+            if upload_type in grouped_uploads:
+                grouped_uploads[upload_type].append(entry)
             else:
-                grouped["important_data"].append(entry)
+                grouped_uploads["important_data"].append(entry)
 
             uploads_state[file_name] = upload_type or "important_data"
 
-        yield f"data: {json.dumps({'type': 'initial_uploads', 'uploads': grouped})}\n\n"
+        yield f"data: {json.dumps({'type': 'initial_uploads', 'uploads': grouped_uploads})}\n\n"
 
         # ---------------------------------------------------------
         # 3️⃣ INITIAL FEEDBACK (ONLY LATEST 5)
@@ -866,7 +879,7 @@ async def provider_live_questions_sse(
             yield f"data: {json.dumps({'type': 'initial_feedback', 'feedbacks': feedback_cleaned})}\n\n"
 
         # ---------------------------------------------------------
-        # 4️⃣ INITIAL TICKETS
+        # 4️⃣ INITIAL TICKETS (PENDING + COMPLETED)
         # ---------------------------------------------------------
         tickets = await _db.tickets.find({
             "provider_email": provider_email
@@ -904,7 +917,7 @@ async def provider_live_questions_sse(
         if last_ticket_time is None:
             last_ticket_time = datetime.utcnow()
 
-        yield f"data: {json.dumps({'type':'initial_tickets','tickets':{'pending':pending_tickets,'completed':completed_tickets}})}\n\n"
+        yield f"data: {json.dumps({'type': 'initial_tickets', 'tickets': {'pending': pending_tickets, 'completed': completed_tickets}})}\n\n"
 
         # ---------------------------------------------------------
         # 5️⃣ INITIAL ALL FEEDBACK (FULL HISTORY)
@@ -925,16 +938,68 @@ async def provider_live_questions_sse(
                 "created_at": created_iso
             })
 
-        yield f"data: {json.dumps({'type':'initial_all_feedback','feedbacks':all_fb_cleaned})}\n\n"
+        yield f"data: {json.dumps({'type': 'initial_all_feedback', 'feedbacks': all_fb_cleaned})}\n\n"
 
         # ---------------------------------------------------------
-        # 🔄 MAIN LOOP STARTS (REAL-TIME UPDATES)
+        # 6️⃣ INITIAL SOCIAL POSTS (LATEST → TOP)
+        # ---------------------------------------------------------
+        posts_filter = {
+            "state": prov_state,
+            "city": prov_city,
+            "$expr": {
+                "$eq": [
+                    {
+                        "$toLower": {
+                            "$replaceAll": {
+                                "input": "$department",
+                                "find": " ",
+                                "replacement": "_"
+                            }
+                        }
+                    },
+                    prov_dept_norm
+                ]
+            }
+        }
+
+        posts_docs = await posts_col.find(posts_filter).sort("created_at", -1).to_list(None)
+
+        initial_posts = []
+        for p in posts_docs:
+            post_id = p.get("post_id")
+            if not post_id:
+                continue
+
+            created_raw = p.get("created_at")
+            if isinstance(created_raw, datetime):
+                created_iso = created_raw.isoformat()
+            else:
+                created_iso = created_raw
+
+            comments = p.get("comments") or []
+            initial_posts.append({
+                "post_id": post_id,
+                "caption": p.get("caption"),
+                "image_url": p.get("image_url"),
+                "created_at": created_iso,
+                "likes_count": int(p.get("likes_count", 0) or 0),
+                "push_count": int(p.get("push_count", 0) or 0),
+                "comments_count": len(comments)
+            })
+            posts_state.add(post_id)
+
+        yield f"data: {json.dumps({'type': 'initial_posts', 'posts': initial_posts})}\n\n"
+
+        # ---------------------------------------------------------
+        # 🔄 MAIN LOOP (REAL-TIME UPDATES)
         # ---------------------------------------------------------
         while True:
             if await request.is_disconnected():
                 break
 
-            # NEW QUESTION
+            # -----------------------------------------------------
+            # A️⃣ NEW QUESTIONS (ONLY AFTER STREAM START)
+            # -----------------------------------------------------
             query = {"provider_email": provider_email}
             if last_ts:
                 query["asked_at"] = {"$gt": last_ts}
@@ -944,10 +1009,14 @@ async def provider_live_questions_sse(
                 last_ts = new_questions[0]["asked_at"]
                 for q in new_questions:
                     q["_id"] = str(q["_id"])
-                    q["asked_at"] = q["asked_at"].isoformat() if isinstance(q["asked_at"], datetime) else q["asked_at"]
-                    yield f"data: {json.dumps({'type':'new_question','question':q})}\n\n"
+                    asked = q.get("asked_at")
+                    if isinstance(asked, datetime):
+                        q["asked_at"] = asked.isoformat()
+                    yield f"data: {json.dumps({'type': 'new_question', 'question': q})}\n\n"
 
-            # NEW FEEDBACK
+            # -----------------------------------------------------
+            # B️⃣ NEW FEEDBACK (ONLY AFTER LAST FEEDBACK TIME)
+            # -----------------------------------------------------
             fb_query = {"provider_email": provider_email}
             if last_feedback_time:
                 fb_query["created_at"] = {"$gt": last_feedback_time}
@@ -965,9 +1034,11 @@ async def provider_live_questions_sse(
                         "feedback_text": fb.get("feedback_text", ""),
                         "created_at": created_iso
                     }
-                    yield f"data: {json.dumps({'type':'new_feedback','feedback':cleaned})}\n\n"
+                    yield f"data: {json.dumps({'type': 'new_feedback', 'feedback': cleaned})}\n\n"
 
-            # UPLOAD CHANGES (added / removed)
+            # -----------------------------------------------------
+            # C️⃣ UPLOAD CHANGES (ADDED / REMOVED)
+            # -----------------------------------------------------
             current_uploads = await _db.uploads.find({
                 "provider_email": provider_email
             }).to_list(None)
@@ -989,33 +1060,47 @@ async def provider_live_questions_sse(
             # added
             added_files = [f for f in new_upload_state if f not in uploads_state]
             for f in added_files:
-                yield f"data: {json.dumps({'type':'upload_added','upload':{'file_name':f,'from':new_upload_state[f],'uploaded_at':created_map[f]}})}\n\n"
+                payload = {
+                    "type": "upload_added",
+                    "upload": {
+                        "file_name": f,
+                        "from": new_upload_state[f],
+                        "uploaded_at": created_map.get(f)
+                    }
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
 
             # removed
             removed_files = [f for f in uploads_state if f not in new_upload_state]
             for f in removed_files:
-                yield f"data: {json.dumps({'type':'upload_removed','file_name':f,'from':uploads_state[f]})}\n\n"
+                payload = {
+                    "type": "upload_removed",
+                    "file_name": f,
+                    "from": uploads_state.get(f)
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
 
             uploads_state = new_upload_state
 
-            # TICKET CHANGES
+            # -----------------------------------------------------
+            # D️⃣ TICKET CHANGES (NEW + UPDATED)
+            # -----------------------------------------------------
             base_ticket_time = last_ticket_time
+            max_ticket_time = base_ticket_time
 
-            # NEW TICKETS
+            # NEW pending tickets
             new_pending = await _db.tickets.find({
                 "provider_email": provider_email,
                 "status": "pending",
                 "created_at": {"$gt": base_ticket_time}
             }).sort("created_at", 1).to_list(None)
 
-            max_ticket_time = base_ticket_time
+            def _iso(dt):
+                return dt.isoformat() if isinstance(dt, datetime) else dt
 
             for t in new_pending:
                 created = t.get("created_at")
                 completed = t.get("completed_at")
-
-                def _iso(dt):
-                    return dt.isoformat() if isinstance(dt, datetime) else dt
 
                 cleaned = {
                     "ticket_id": t.get("ticket_id"),
@@ -1026,12 +1111,12 @@ async def provider_live_questions_sse(
                     "completed_at": _iso(completed)
                 }
 
-                if isinstance(created, datetime) and created > max_ticket_time:
+                if isinstance(created, datetime) and (max_ticket_time is None or created > max_ticket_time):
                     max_ticket_time = created
 
-                yield f"data: {json.dumps({'type':'new_ticket','ticket':cleaned})}\n\n"
+                yield f"data: {json.dumps({'type': 'new_ticket', 'ticket': cleaned})}\n\n"
 
-            # UPDATED TICKETS (completed)
+            # UPDATED tickets (completed)
             updated = await _db.tickets.find({
                 "provider_email": provider_email,
                 "status": "completed",
@@ -1042,9 +1127,6 @@ async def provider_live_questions_sse(
                 created = t.get("created_at")
                 completed = t.get("completed_at")
 
-                def _iso(dt):
-                    return dt.isoformat() if isinstance(dt, datetime) else dt
-
                 cleaned = {
                     "ticket_id": t.get("ticket_id"),
                     "user_name": t.get("user_name"),
@@ -1054,20 +1136,84 @@ async def provider_live_questions_sse(
                     "completed_at": _iso(completed)
                 }
 
-                if isinstance(completed, datetime) and completed > max_ticket_time:
+                if isinstance(completed, datetime) and (max_ticket_time is None or completed > max_ticket_time):
                     max_ticket_time = completed
 
-                yield f"data: {json.dumps({'type':'ticket_updated','ticket':cleaned})}\n\n"
+                yield f"data: {json.dumps({'type': 'ticket_updated', 'ticket': cleaned})}\n\n"
 
-            if max_ticket_time > last_ticket_time:
+            if max_ticket_time and max_ticket_time > last_ticket_time:
                 last_ticket_time = max_ticket_time
 
-            # ANALYTICS ON CHANGE
+            # -----------------------------------------------------
+            # E️⃣ SOCIAL POSTS: NEW + DELETED
+            # -----------------------------------------------------
+            current_posts_docs = await posts_col.find(posts_filter).to_list(None)
+
+            current_posts_state = set()
+            posts_index = {}
+
+            for p in current_posts_docs:
+                post_id = p.get("post_id")
+                if not post_id:
+                    continue
+                current_posts_state.add(post_id)
+
+                created_raw = p.get("created_at")
+                if isinstance(created_raw, datetime):
+                    created_iso = created_raw.isoformat()
+                else:
+                    created_iso = created_raw
+
+                comments = p.get("comments") or []
+                posts_index[post_id] = {
+                    "post_id": post_id,
+                    "caption": p.get("caption"),
+                    "image_url": p.get("image_url"),
+                    "created_at": created_iso,
+                    "likes_count": int(p.get("likes_count", 0) or 0),
+                    "push_count": int(p.get("push_count", 0) or 0),
+                    "comments_count": len(comments)
+                }
+
+            # NEW POSTS
+            new_post_ids = current_posts_state - posts_state
+            for pid in new_post_ids:
+                payload = {
+                    "type": "new_post",
+                    "post": posts_index[pid]
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            # DELETED POSTS
+            deleted_post_ids = posts_state - current_posts_state
+            for pid in deleted_post_ids:
+                payload = {
+                    "type": "post_deleted",
+                    "post_id": pid
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+            posts_state = current_posts_state
+
+            # -----------------------------------------------------
+            # F️⃣ ANALYTICS (ONLY WHEN CHANGED) + SMARTSOLVE
+            # -----------------------------------------------------
             current_analytics = {
-                "log_question_count": await _db.questions_asked.count_documents({"provider_email": provider_email}),
-                "todays_ticket_count": await _db.tickets.count_documents({"provider_email": provider_email, "created_at": {"$gte": today_start, "$lt": today_end}}),
-                "pending_ticket_count": await _db.tickets.count_documents({"provider_email": provider_email, "status": "pending"}),
-                "completed_ticket_count": await _db.tickets.count_documents({"provider_email": provider_email, "status": "completed"}),
+                "log_question_count": await _db.questions_asked.count_documents({
+                    "provider_email": provider_email
+                }),
+                "todays_ticket_count": await _db.tickets.count_documents({
+                    "provider_email": provider_email,
+                    "created_at": {"$gte": today_start, "$lt": today_end}
+                }),
+                "pending_ticket_count": await _db.tickets.count_documents({
+                    "provider_email": provider_email,
+                    "status": "pending"
+                }),
+                "completed_ticket_count": await _db.tickets.count_documents({
+                    "provider_email": provider_email,
+                    "status": "completed"
+                }),
                 "complaints_count": await _db.posts.count_documents({
                     "state": prov_state,
                     "city": prov_city,
@@ -1088,18 +1234,32 @@ async def provider_live_questions_sse(
                 })
             }
 
+            # 🔹 Trigger SmartSolve only when pending > 4 AND count changed
+            pending_cnt = current_analytics.get("pending_ticket_count", 0)
+            if pending_cnt > 4 and pending_cnt != last_smartsolve_pending_count:
+                try:
+                    smartsolve_result = await smartsolve_cluster_pending(provider_email)
+                    yield f"data: {json.dumps({'type': 'smartsolve_result', 'result': smartsolve_result})}\n\n"
+                    last_smartsolve_pending_count = pending_cnt
+                except Exception as e:
+                    # Don't break SSE if SmartSolve fails
+                    print("SmartSolve failed:", e)
+
+            # send analytics ONLY when changed
             if last_analytics != current_analytics:
                 last_analytics = current_analytics.copy()
-                yield f"data: {json.dumps({'type':'analytics','analytics':current_analytics})}\n\n"
+                yield f"data: {json.dumps({'type': 'analytics', 'analytics': current_analytics})}\n\n"
 
-            # HEARTBEAT
-            yield f"data: {json.dumps({'type':'heartbeat','time':datetime.utcnow().isoformat()})}\n\n"
+            # -----------------------------------------------------
+            # G️⃣ HEARTBEAT
+            # -----------------------------------------------------
+            yield f"data: {json.dumps({'type': 'heartbeat', 'time': datetime.utcnow().isoformat()})}\n\n"
 
+            # small delay to reduce DB load / cost
             await asyncio.sleep(3)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-# ---------------------------------------------------------
 # API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
 # ---------------------------------------------------------
 @router.get("/{provider_email}/questions/filter")
