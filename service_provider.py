@@ -382,6 +382,45 @@ def _parse_delete_time(delete_at: Optional[str]):
     except Exception:
         return None
 
+# ---------------------------------------------------------
+# DATE FILTER HELPER (today, yesterday, week, month, year)
+# ---------------------------------------------------------
+def _get_question_date_filter(filter_by: Optional[str]):
+    now = datetime.utcnow()
+
+    if filter_by == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return {"$gte": start, "$lt": end}
+
+    if filter_by == "yesterday":
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=1)
+        return {"$gte": start, "$lt": end}
+
+    if filter_by == "this_week":
+        start = now - timedelta(days=now.weekday())  # Monday start
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        return {"$gte": start, "$lt": end}
+
+    if filter_by == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Next month
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        return {"$gte": start, "$lt": end}
+
+    if filter_by == "this_year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1)
+        return {"$gte": start, "$lt": end}
+
+    return None
+
+
 # ------------------------------
 # Request models
 # ------------------------------
@@ -907,3 +946,85 @@ async def get_provider_files(provider_email: str, upload_type: Optional[str] = N
         "total_files": len(files),
         "storage_provider": "ImageKit.io + GFAPI"
     }
+
+# ---------------------------------------------------------
+# API 1: LIVE STREAM OF LATEST QUESTIONS (for websocket/polling)
+# ---------------------------------------------------------
+@router.get("/provider/{provider_email}/questions/live")
+async def provider_live_questions(
+    provider_email: str,
+    since: Optional[str] = None,
+    limit: int = 30
+):
+    # Check provider exists
+    provider = await _db.providers.find_one({"email": provider_email})
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+
+    query = {"provider_email": provider_email}
+
+    # If "since" timestamp is provided → return only NEW questions
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+            query["asked_at"] = {"$gt": since_dt}
+        except Exception:
+            raise HTTPException(
+                400,
+                "Invalid since timestamp. Must be ISO, e.g. 2025-11-23T14:22:10"
+            )
+
+    logs = await _db.questions_asked.find(query) \
+        .sort("asked_at", -1) \
+        .limit(limit) \
+        .to_list(None)
+
+    # Clean ObjectIds
+    for log in logs:
+        log["_id"] = str(log["_id"])
+
+    # Provide latest timestamp to help client maintain a cursor
+    latest_ts = logs[0]["asked_at"] if logs else None
+
+    return {
+        "success": True,
+        "provider_email": provider_email,
+        "count": len(logs),
+        "latest_timestamp": latest_ts,
+        "questions": logs
+    }
+
+# ---------------------------------------------------------
+# API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
+# ---------------------------------------------------------
+@router.get("/provider/{provider_email}/questions/filter")
+async def provider_filtered_questions(
+    provider_email: str,
+    filter_by: Optional[str] = None
+):
+    # Check provider exists
+    provider = await _db.providers.find_one({"email": provider_email})
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+
+    query = {"provider_email": provider_email}
+
+    date_filter = _get_question_date_filter(filter_by)
+    if date_filter:
+        query["asked_at"] = date_filter
+
+    logs = await _db.questions_asked.find(query) \
+        .sort("asked_at", -1) \
+        .to_list(None)
+
+    for log in logs:
+        log["_id"] = str(log["_id"])
+
+    return {
+        "success": True,
+        "provider_email": provider_email,
+        "filter": filter_by or "all",
+        "count": len(logs),
+        "questions": logs
+    }
+
