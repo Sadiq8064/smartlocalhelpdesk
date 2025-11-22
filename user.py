@@ -355,6 +355,66 @@ async def _store_conversation(session_id: str, email: str, question: str, resp: 
 
 
 # -----------------------------------------------------------
+# Provider question logs (per-service questions actually sent to RAG)
+# -----------------------------------------------------------
+async def _log_provider_questions(
+    user_email: str,
+    user_name: Optional[str],
+    final_answers: List[Dict]
+):
+    """
+    Stores, for each service provider, the *exact* question that was sent
+    to that provider's vector store, along with the AI answer and timestamp.
+
+    Collection: `questions_asked`
+    Document example:
+    {
+        provider_email: "...",
+        user_email: "...",
+        user_name: "...",
+        store_name: "...",
+        question: "...",   # q used for that store (after Gemini split)
+        response: "...",   # answer for that store
+        asked_at: datetime(...)
+    }
+    """
+    if not final_answers:
+        return
+
+    try:
+        logs = []
+
+        for fa in final_answers:
+            store = fa.get("store")
+            vector_question = fa.get("question")
+            answer = fa.get("answer")
+
+            if not store or not vector_question:
+                continue
+
+            # Find which provider owns this store
+            service = await _db.services.find_one({"search_store.store_name": store})
+            if not service:
+                continue
+
+            logs.append({
+                "provider_email": service["provider_email"],
+                "user_email": user_email,
+                "user_name": user_name,
+                "store_name": store,
+                "question": vector_question,   # 🔥 question sent to that store's vector search
+                "response": answer,            # 🔥 that store's AI answer only
+                "asked_at": datetime.utcnow()
+            })
+
+        if logs:
+            await _db.questions_asked.insert_many(logs)
+
+    except Exception as e:
+        logger.exception("Failed saving provider question logs: %s", e)
+
+
+# -----------------------------------------------------------
 # Pydantic Models
 # -----------------------------------------------------------
 class UserSendOtp(BaseModel):
@@ -923,7 +983,7 @@ async def ask_question(req: AskQuestionRequest):
                 "by any available service department:\n" + "\n".join(extra_lines)
             )
 
-    resp = {
+        resp = {
         "success": True,
         "session_id": session_id,
         "response": final_text,
@@ -933,6 +993,21 @@ async def ask_question(req: AskQuestionRequest):
         "unanswered_parts": unanswered_parts
     }
 
+    # 🔥 Fire-and-forget logging of provider-specific questions/answers
+    # This uses the *split* questions (fa["question"]) that were actually
+    # sent to each provider's vector store.
+    try:
+        asyncio.create_task(
+            _log_provider_questions(
+                user_email=req.email,
+                user_name=user.get("name"),
+                final_answers=final_answers
+            )
+        )
+    except Exception as e:
+        logger.exception("Failed to schedule provider question logging: %s", e)
+
+    # Existing conversation history (kept as-is)
     await _store_conversation(session_id, req.email, req.question, resp)
     return resp
 
