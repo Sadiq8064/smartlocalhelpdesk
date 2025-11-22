@@ -929,7 +929,7 @@ async def ask_question(req: AskQuestionRequest):
         "response": final_text,
         "stores_used": selected_stores,
         "sources": all_sources[:1],
-        "detailed": final_answers,
+        # "detailed": final_answers,
         "unanswered_parts": unanswered_parts
     }
 
