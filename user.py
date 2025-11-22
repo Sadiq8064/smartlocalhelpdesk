@@ -830,7 +830,6 @@ async def ask_question(req: AskQuestionRequest):
             "response": "No services available in your area.",
             "stores_used": [],
             "sources": [],
-            "detailed": [],
             "unanswered_parts": []
         }
         await _store_conversation(session_id, req.email, req.question, resp)
@@ -862,7 +861,6 @@ async def ask_question(req: AskQuestionRequest):
             "response": resp_text,
             "stores_used": [],
             "sources": [],
-            "detailed": [],
             "unanswered_parts": unanswered_parts
         }
         await _store_conversation(session_id, req.email, req.question, resp)
@@ -930,7 +928,7 @@ async def ask_question(req: AskQuestionRequest):
         "session_id": session_id,
         "response": final_text,
         "stores_used": selected_stores,
-        "sources": all_sources[:5],
+        "sources": all_sources[:1],
         "detailed": final_answers,
         "unanswered_parts": unanswered_parts
     }
