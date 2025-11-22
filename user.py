@@ -9,6 +9,8 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict
 from bson import ObjectId
+from zoneinfo import ZoneInfo
+
 
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
@@ -404,7 +406,7 @@ async def _log_provider_questions(
                 "store_name": store,
                 "question": vector_question,   # 🔥 question sent to that store's vector search
                 "response": answer,            # 🔥 that store's AI answer only
-                "asked_at": datetime.utcnow()
+                "asked_at": datetime.now(ZoneInfo("Asia/Kolkata")).replace(microsecond=0)
             })
 
         if logs:
