@@ -728,71 +728,143 @@ async def _send_ticket_completion_email(user_email: str, user_name: str, ticket_
 # ---------------------------------------------------------
 # API 1: LIVE STREAM OF LATEST QUESTIONS (for websocket/polling)
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# API: COMBINED LIVE QUESTIONS + ANALYTICS SSE
+# ---------------------------------------------------------
 @router.get("/{provider_email}/questions/sse")
 async def provider_live_questions_sse(
     request: Request,
     provider_email: str
 ):
     """
-    SSE stream of ONLY:
-    - new questions asked
-    - heartbeat timestamp
+    SSE stream of:
+    - new questions asked to this provider
+    - analytics summary (5 metrics)
+    - heartbeat
     """
 
-    # Check provider exists
+    # Validate provider
     provider = await _db.providers.find_one({"email": provider_email})
     if not provider:
         raise HTTPException(404, "Provider not found")
+
+    # Provider’s service info (needed for complaints)
+    service = await _db.services.find_one({"provider_email": provider_email})
+    if not service:
+        raise HTTPException(404, "Service not found")
+
+    prov_state = service["state"]
+    prov_city = service["city"]
+    prov_dept = service["department"]
+    prov_dept_norm = prov_dept.strip().replace(" ", "_").lower()
 
     async def event_generator():
         last_ts = None
 
         while True:
 
-            # Stop if client disconnects
+            # Stop if frontend disconnects
             if await request.is_disconnected():
                 print("SSE client disconnected")
                 break
 
+            # -------------------------------------------------
+            # 1️⃣ STREAM NEW QUESTIONS
+            # -------------------------------------------------
             query = {"provider_email": provider_email}
 
             if last_ts:
                 query["asked_at"] = {"$gt": last_ts}
 
-            # Fetch latest questions for provider
             new_questions = await _db.questions_asked \
                 .find(query) \
                 .sort("asked_at", -1) \
                 .to_list(length=None)
 
-            # Stream new questions only
             if new_questions:
                 last_ts = new_questions[0]["asked_at"]
 
                 for q in new_questions:
                     q["_id"] = str(q["_id"])
-
                     if isinstance(q.get("asked_at"), datetime):
                         q["asked_at"] = q["asked_at"].isoformat()
 
-                    payload = {
-                        "type": "new_question",
-                        "question": q
-                    }
+                    yield f"data: {json.dumps({'type': 'new_question','question': q})}\n\n"
 
-                    yield f"data: {json.dumps(payload)}\n\n"
+            # -------------------------------------------------
+            # 2️⃣ ANALYTICS SNAPSHOT (EVERY SECOND)
+            # -------------------------------------------------
 
-            # Heartbeat with timestamp only
+            # Total question logs
+            log_question_count = await _db.questions_asked.count_documents({
+                "provider_email": provider_email
+            })
+
+            # Today's tickets
+            now = datetime.utcnow()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+
+            todays_ticket_count = await _db.tickets.count_documents({
+                "provider_email": provider_email,
+                "created_at": {"$gte": today_start, "$lt": today_end}
+            })
+
+            # Pending tickets
+            pending_ticket_count = await _db.tickets.count_documents({
+                "provider_email": provider_email,
+                "status": "pending"
+            })
+
+            # Completed tickets
+            completed_ticket_count = await _db.tickets.count_documents({
+                "provider_email": provider_email,
+                "status": "completed"
+            })
+
+            # Complaints from social posts
+            complaints_count = await _db.posts.count_documents({
+                "state": prov_state,
+                "city": prov_city,
+                "$expr": {
+                    "$eq": [
+                        {"$toLower": {"$replaceAll": {
+                            "input": "$department",
+                            "find": " ",
+                            "replacement": "_"
+                        }}},
+                        prov_dept_norm
+                    ]
+                }
+            })
+
+            analytics_payload = {
+                "type": "analytics",
+                "analytics": {
+                    "log_question_count": log_question_count,
+                    "todays_ticket_count": todays_ticket_count,
+                    "pending_ticket_count": pending_ticket_count,
+                    "completed_ticket_count": completed_ticket_count,
+                    "complaints_count": complaints_count
+                }
+            }
+
+            yield f"data: {json.dumps(analytics_payload)}\n\n"
+
+            # -------------------------------------------------
+            # 3️⃣ HEARTBEAT
+            # -------------------------------------------------
             heartbeat = {
                 "type": "heartbeat",
                 "time": datetime.utcnow().isoformat()
             }
-
             yield f"data: {json.dumps(heartbeat)}\n\n"
 
+            # Interval
             await asyncio.sleep(1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 # ---------------------------------------------------------
 # API 2: FILTERED QUESTIONS (today, yesterday, week, month, year)
