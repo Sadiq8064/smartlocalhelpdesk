@@ -1095,7 +1095,7 @@ async def provider_live_questions_sse(
             # HEARTBEAT
             yield f"data: {json.dumps({'type':'heartbeat','time':datetime.utcnow().isoformat()})}\n\n"
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
