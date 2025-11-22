@@ -110,7 +110,10 @@ async def _send_brevo_email(to_email: str, subject: str, html_content: str):
             return {"success": True, "message_id": getattr(resp, "message_id", None), "raw": resp}
         except ApiException as e:
             # ApiException has body and status — include details
-            raise RuntimeError(f"Brevo ApiException: status={getattr(e, 'status', None)} body={getattr(e, 'body', None)}")
+            raise RuntimeError(
+                f"Brevo ApiException: status={getattr(e, 'status', None)} "
+                f"body={getattr(e, 'body', None)}"
+            )
 
     loop = asyncio.get_running_loop()
     try:
@@ -154,22 +157,79 @@ def _init_gemini_client_sync(api_key: str):
 
 
 def _call_gemini_sync(client, stores: List[str], question: str) -> str:
+    """
+    Synchronous helper to call Gemini model for store selection and question splitting.
+    Returns raw text (expected to be JSON).
+    """
     model = "gemini-2.5-flash"
 
+    # New routing + splitting system prompt
     system_prompt = f"""
-Given:
-Available Stores = {stores}
-User Question = "{question}"
+You are a classifier that analyzes a user's question and determines:
 
-Return ONLY valid JSON:
+1. Which government service departments (from the list below) can answer which parts of the question.
+2. A single question may contain:
+   - One relevant part
+   - Multiple relevant parts for different departments
+   - Irrelevant parts that no department can answer
+
+Your task:
+---------------------
+Given the available stores (departments):
+{stores}
+
+And the user's question:
+"{question}"
+
+You MUST break the question into meaningful parts and assign them as follows:
+
+1. For every relevant part:
+   - Identify which store (department) it belongs to.
+   - Rewrite the question part only for clarity, keeping EXACT meaning.
+   - Return it in `split_questions` under that store name.
+
+2. If a question part belongs to multiple stores:
+   - Add the same rewritten part under all relevant stores.
+
+3. If a question part does NOT belong to any store:
+   - Include it in an "unanswered" array with a reason like:
+       "No service department can answer this."
+
+IMPORTANT RULES:
+---------------------
+- DO NOT change the user's original intent.
+- DO NOT add or remove information.
+- Only restructure the language for clarity.
+- You must always return valid JSON exactly in this format:
+
 {{
   "stores": ["store1", "store2"],
   "split_questions": {{
-      "store1": "q1",
-      "store2": "q2"
-  }}
+      "store1": "rewritten question part for store1",
+      "store2": "rewritten question part for store2"
+  }},
+  "unanswered": [
+      {{
+         "text": "part of question that no store can answer",
+         "reason": "why no department can answer"
+      }}
+  ]
 }}
-If no store relevant: {{"stores":[]}}
+
+NOTES:
+---------------------
+- If no part of the question belongs to any store, return:
+  {{
+    "stores": [],
+    "split_questions": {{}},
+    "unanswered": [
+      {{
+        "text": "{question}",
+        "reason": "No service department can answer this"
+      }}
+    ]
+  }}
+- You MUST return valid JSON ONLY. No explanation, no extra text.
 """
 
     response = client.models.generate_content(
@@ -189,14 +249,26 @@ If no store relevant: {{"stores":[]}}
     return txt or ""
 
 
-async def _call_gemini_for_store_selection(stores: List[str], question: str):
-    """Runs Gemini SDK inside a threadpool, extracts JSON safely."""
+async def _call_gemini_for_store_selection(stores: List[str], question: str) -> Dict:
+    """
+    Runs Gemini SDK inside a threadpool, extracts JSON safely.
+    Returns:
+    {
+      "stores": [...],
+      "split_questions": {store: question_part},
+      "unanswered": [ { "text": "...", "reason": "..." }, ... ]
+    }
+
+    IMPORTANT:
+    - If Gemini fails or is missing → fall back to all stores (no splitting).
+    - Only when Gemini explicitly returns "stores": [] we treat as "no service can answer".
+    """
     if not stores:
-        return {"stores": []}
+        return {"stores": [], "split_questions": {}, "unanswered": []}
 
     if genai is None:
-        logger.warning("Gemini SDK missing => returning all stores.")
-        return {"stores": stores}
+        logger.warning("Gemini SDK missing => returning all stores without splitting.")
+        return {"stores": stores, "split_questions": {}, "unanswered": []}
 
     loop = asyncio.get_running_loop()
 
@@ -204,7 +276,8 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str):
         client = await loop.run_in_executor(None, _init_gemini_client_sync, GEMINI_API_KEY)
         raw = await loop.run_in_executor(None, _call_gemini_sync, client, stores, question)
         if not raw:
-            return {"stores": stores}
+            logger.warning("Gemini returned empty response => using all stores.")
+            return {"stores": stores, "split_questions": {}, "unanswered": []}
 
         raw = raw.strip()
 
@@ -212,10 +285,11 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str):
         try:
             parsed = json.loads(raw)
             return {
-                "stores": parsed.get("stores", []),
-                "split_questions": parsed.get("split_questions", {})
+                "stores": parsed.get("stores", []) or [],
+                "split_questions": parsed.get("split_questions", {}) or {},
+                "unanswered": parsed.get("unanswered", []) or []
             }
-        except:
+        except Exception:
             # Attempt to extract JSON substring
             start = raw.find("{")
             end = raw.rfind("}")
@@ -223,17 +297,21 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str):
                 try:
                     parsed = json.loads(raw[start:end + 1])
                     return {
-                        "stores": parsed.get("stores", []),
-                        "split_questions": parsed.get("split_questions", {})
+                        "stores": parsed.get("stores", []) or [],
+                        "split_questions": parsed.get("split_questions", {}) or {},
+                        "unanswered": parsed.get("unanswered", []) or []
                     }
-                except:
-                    pass
+                except Exception:
+                    logger.exception("Gemini JSON substring parse failed.")
 
-        return {"stores": stores}
+        # If everything fails, fall back to all stores
+        logger.warning("Gemini parsing failed => using all stores.")
+        return {"stores": stores, "split_questions": {}, "unanswered": []}
 
     except Exception as e:
         logger.exception("Gemini failed: %s", e)
-        return {"stores": stores}
+        # On failure, still try all stores instead of blocking the flow
+        return {"stores": stores, "split_questions": {}, "unanswered": []}
 
 
 # -----------------------------------------------------------
@@ -314,6 +392,8 @@ class AskQuestionRequest(BaseModel):
     email: EmailStr
     question: str
     session_id: Optional[str] = None
+
+
 class CreateFeedbackRequest(BaseModel):
     user_email: EmailStr
     provider_email: EmailStr
@@ -331,6 +411,8 @@ class UpdateFeedbackRequest(BaseModel):
 class DeleteFeedbackRequest(BaseModel):
     user_email: EmailStr
     feedback_id: str
+
+
 # -----------------------------------------------------------
 #  ENDPOINTS
 # -----------------------------------------------------------
@@ -365,6 +447,7 @@ async def user_send_otp(req: UserSendOtp):
     )
 
     return {"success": True, "message": "OTP sent"}
+
 
 # -----------------------------------------------------------
 # CREATE FEEDBACK
@@ -410,6 +493,7 @@ async def create_feedback(req: CreateFeedbackRequest):
         "message": "Feedback created successfully",
         "feedback_id": str(result.inserted_id)
     }
+
 
 # -----------------------------------------------------------
 # GET ALL FEEDBACK FOR A PROVIDER
@@ -458,6 +542,7 @@ async def provider_feedback(provider_email: str):
         ]
     }
 
+
 # -----------------------------------------------------------
 # UPDATE FEEDBACK
 # -----------------------------------------------------------
@@ -466,7 +551,7 @@ async def update_feedback(req: UpdateFeedbackRequest):
     # Convert id
     try:
         fid = ObjectId(req.feedback_id)
-    except:
+    except Exception:
         raise HTTPException(400, "Invalid feedback ID")
 
     fb = await _db.feedback.find_one({"_id": fid})
@@ -500,7 +585,7 @@ async def update_feedback(req: UpdateFeedbackRequest):
 async def delete_feedback(req: DeleteFeedbackRequest):
     try:
         fid = ObjectId(req.feedback_id)
-    except:
+    except Exception:
         raise HTTPException(400, "Invalid feedback ID")
 
     fb = await _db.feedback.find_one({"_id": fid})
@@ -518,6 +603,7 @@ async def delete_feedback(req: DeleteFeedbackRequest):
         "message": "Feedback deleted successfully"
     }
 
+
 # ----------------- VERIFY OTP -----------------
 @router.post("/verify_otp")
 async def user_verify_otp(req: UserVerifyOtp):
@@ -531,8 +617,10 @@ async def user_verify_otp(req: UserVerifyOtp):
     if otp_doc["otp"] != req.otp:
         raise HTTPException(400, "OTP mismatch")
 
-    await _db.otps.update_one({"email": req.email, "type": "user"},
-                              {"$set": {"verified": True}})
+    await _db.otps.update_one(
+        {"email": req.email, "type": "user"},
+        {"$set": {"verified": True}}
+    )
 
     return {"success": True, "message": "OTP verified"}
 
@@ -741,32 +829,49 @@ async def ask_question(req: AskQuestionRequest):
             "session_id": session_id,
             "response": "No services available in your area.",
             "stores_used": [],
+            "sources": [],
+            "detailed": [],
+            "unanswered_parts": []
         }
         await _store_conversation(session_id, req.email, req.question, resp)
         return resp
 
     # --- Predict store relevance using Gemini ---
     gemini_result = await _call_gemini_for_store_selection(stores, req.question)
-    selected_stores = gemini_result.get("stores", [])
+    selected_stores = gemini_result.get("stores", []) or []
+    split_q = gemini_result.get("split_questions", {}) or {}
+    unanswered_parts = gemini_result.get("unanswered", []) or []
 
-# If Gemini finds no matching store → return immediately
-if not selected_stores:
-    resp = {
-        "success": True,
-        "session_id": session_id,
-        "response": "Sorry, no available service can answer this question.",
-        "stores_used": [],
-        "sources": [],
-        "detailed": []
-    }
-    await _store_conversation(session_id, req.email, req.question, resp)
-    return resp
+    # OPTION A: If Gemini explicitly finds no matching store → return immediately
+    if not selected_stores:
+        resp_text = "Sorry, no available service can answer this question."
+        if unanswered_parts:
+            # Make response a bit more informative, but frontend still has structured data
+            extra = []
+            for part in unanswered_parts:
+                txt = part.get("text") or ""
+                reason = part.get("reason") or ""
+                if txt:
+                    extra.append(f"- \"{txt}\" ({reason})" if reason else f"- \"{txt}\"")
+            if extra:
+                resp_text += "\n\nDetails:\n" + "\n".join(extra)
 
-    split_q = gemini_result.get("split_questions", {})
+        resp = {
+            "success": True,
+            "session_id": session_id,
+            "response": resp_text,
+            "stores_used": [],
+            "sources": [],
+            "detailed": [],
+            "unanswered_parts": unanswered_parts
+        }
+        await _store_conversation(session_id, req.email, req.question, resp)
+        return resp
 
     final_answers = []
     all_sources = []
 
+    # Call RAG only for selected stores
     for store in selected_stores:
         q = split_q.get(store, req.question)
         rag = await _call_rag_api(store, q)
@@ -787,18 +892,38 @@ if not selected_stores:
 
         final_answers.append({
             "store": store,
+            "question": q,
             "answer": ans,
             "sources": sources
         })
         all_sources.extend(sources)
 
-    # Combine multi-store answers
+    # Combine multi-store answers into a single text response
     if len(final_answers) == 1:
         final_text = final_answers[0]["answer"]
     else:
-        final_text = ""
+        parts = []
         for fa in final_answers:
-            final_text += f"**{fa['store']}**: {fa['answer']}\n\n"
+            parts.append(f"**{fa['store']}**:\n{fa['answer']}")
+        final_text = "\n\n".join(parts)
+
+    # Append info about unanswered parts (if any)
+    if unanswered_parts:
+        extra_lines = []
+        for part in unanswered_parts:
+            txt = part.get("text") or ""
+            reason = part.get("reason") or ""
+            if not txt:
+                continue
+            if reason:
+                extra_lines.append(f"- \"{txt}\" ({reason})")
+            else:
+                extra_lines.append(f"- \"{txt}\"")
+        if extra_lines:
+            final_text += (
+                "\n\nThe following parts of your question could not be answered "
+                "by any available service department:\n" + "\n".join(extra_lines)
+            )
 
     resp = {
         "success": True,
@@ -806,7 +931,8 @@ if not selected_stores:
         "response": final_text,
         "stores_used": selected_stores,
         "sources": all_sources[:5],
-        "detailed": final_answers
+        "detailed": final_answers,
+        "unanswered_parts": unanswered_parts
     }
 
     await _store_conversation(session_id, req.email, req.question, resp)
