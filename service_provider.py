@@ -756,7 +756,7 @@ async def provider_live_questions_sse(
     prov_dept_norm = prov_dept.strip().replace(" ", "_").lower()
 
     async def event_generator():
-        last_ts = None
+        last_ts = datetime.utcnow()
         last_analytics = None
         last_feedback_time = None
         last_ticket_time = None
