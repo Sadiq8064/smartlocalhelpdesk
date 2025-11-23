@@ -3,7 +3,7 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 
 import aiohttp
 from bson import ObjectId
@@ -98,10 +98,145 @@ def _extract_website_name(url: str) -> str:
     return name
 
 
+def _get_root_url(original_url: str) -> str:
+    """
+    Return scheme://domain root from any URL.
+    Example:
+        https://knowindia.india.gov.in/profile/local-government.php
+        -> https://knowindia.india.gov.in
+    """
+    if not original_url:
+        return "https://unknown.local"
+
+    url = original_url.strip()
+    parsed = urlparse(url)
+
+    # If user passed without scheme, assume https
+    if not parsed.scheme:
+        parsed = urlparse("https://" + url)
+
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path.split("/")[0]
+
+    return f"{scheme}://{netloc}"
+
+
+def _merge_crawler_objects(objs: List[Dict[str, Any]], original_url: str) -> Dict[str, Any]:
+    """
+    Merge multiple crawler JSON objects into one:
+    {
+      "url": <root-of-original-url>,
+      "chunks": [...merged...],
+      "pdfs":   [...merged...],
+      "images": [...merged...]
+    }
+    """
+    merged_chunks: List[str] = []
+    merged_pdfs: List[Any] = []
+    merged_images: List[Dict[str, Any]] = []
+
+    for obj in objs:
+        # chunks
+        if isinstance(obj.get("chunks"), list):
+            merged_chunks.extend(obj["chunks"])
+
+        # pdfs
+        if isinstance(obj.get("pdfs"), list):
+            merged_pdfs.extend(obj["pdfs"])
+
+        # images
+        if isinstance(obj.get("images"), list):
+            merged_images.extend(obj["images"])
+
+    # Optionally de-duplicate images by URL
+    seen_urls = set()
+    unique_images = []
+    for img in merged_images:
+        url = img.get("url")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_images.append(img)
+
+    root_url = _get_root_url(original_url)
+
+    return {
+        "url": root_url,
+        "chunks": merged_chunks,
+        "pdfs": merged_pdfs,
+        "images": unique_images,
+    }
+
+
+def _parse_crawler_stream(raw: str, original_url: str) -> Dict[str, Any]:
+    """
+    The crawler may return:
+      1) A single JSON object
+      2) Multiple JSON objects, one per line (NDJSON-style)
+
+    This function:
+      - first tries to parse as a single JSON object
+      - if that fails, splits by lines and parses each as JSON
+      - then merges all objects into a single combined JSON
+    """
+    cleaned = (raw or "").strip().lstrip("\ufeff")
+
+    if not cleaned:
+        raise HTTPException(
+            status_code=500,
+            detail="Crawler returned empty response"
+        )
+
+    # Try single JSON object first
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return _merge_crawler_objects([obj], original_url)
+        if isinstance(obj, list):
+            # If crawler returns a list directly, merge list items
+            list_objs = [o for o in obj if isinstance(o, dict)]
+            if not list_objs:
+                raise ValueError("List contained no JSON objects")
+            return _merge_crawler_objects(list_objs, original_url)
+    except Exception:
+        pass
+
+    # Fallback: NDJSON / multiple JSON objects (one per line)
+    objs: List[Dict[str, Any]] = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                objs.append(parsed)
+        except Exception:
+            # skip malformed lines
+            continue
+
+    if not objs:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to parse crawler response as JSON (stream)."
+        )
+
+    return _merge_crawler_objects(objs, original_url)
+
+
 async def _call_web_scraper(url: str) -> Any:
     """
-    Call external webscrapper service and return JSON body.
-    Now supports incorrect content-type, stray whitespace, and BOM.
+    Call external webscrapper service and return a SINGLE merged JSON:
+      {
+        "url": <root domain of requested url>,
+        "chunks": [...],
+        "pdfs": [...],
+        "images": [...]
+      }
+
+    Handles:
+      - incorrect content-type
+      - single JSON object
+      - streamed multiple JSON objects (NDJSON-style)
     """
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -111,8 +246,8 @@ async def _call_web_scraper(url: str) -> Any:
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(full_url, timeout=120) as resp:
-                text = await resp.text()
+            async with session.get(full_url, timeout=240) as resp:
+                raw_text = await resp.text()
 
                 if resp.status != 200:
                     raise HTTPException(
@@ -120,27 +255,24 @@ async def _call_web_scraper(url: str) -> Any:
                         detail=f"Web scraper failed with status {resp.status}"
                     )
 
-                # ---- SAFE JSON PARSING ----
+                # We ignore resp.json() because the crawler often streams NDJSON
+                # and/or sends wrong content-type. Instead, we parse manually.
                 try:
-                    # Try using aiohttp's parser IF content-type is JSON
-                    return await resp.json(content_type=None)
-                except:
-                    pass
-
-                # Manual JSON clean-up
-                cleaned = text.strip().lstrip("\ufeff")
-
-                try:
-                    return json.loads(cleaned)
+                    merged = _parse_crawler_stream(raw_text, url)
+                    return merged
+                except HTTPException:
+                    raise
                 except Exception as e:
+                    logger.exception("Crawler parse error: %s", e)
                     raise HTTPException(
                         status_code=500,
-                        detail="Failed to parse crawler response as JSON. Raw: " + cleaned
+                        detail="Failed to parse crawler response as JSON stream."
                     )
 
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Error calling web scraper: %s", e)
         raise HTTPException(
             status_code=500,
             detail=f"Error calling web scraper: {e}"
@@ -222,14 +354,14 @@ class UpdateWebsiteRequest(BaseModel):
 async def scrape_and_upload(req: ScrapeAndUploadRequest):
     """
     1. Validate provider & service
-    2. Call webscrapper API with given URL
+    2. Call webscrapper API with given URL (streaming-safe, merged output)
     3. Derive website_name -> website_name.json
     4. Upload JSON to GFAPI using provider's store_name and GKEY
     5. Store record in MongoDB collection `service_provider_sites`:
          - url
          - text
          - read_website = true
-         - json_content
+         - json_content (merged JSON)
          - filename (from GFAPI)
          - store_name
          - gfapi.document_id, gfapi.document_resource
@@ -246,7 +378,7 @@ async def scrape_and_upload(req: ScrapeAndUploadRequest):
             detail="Website already configured for this provider. Use /update_website to change it.",
         )
 
-    # 1) Crawl website
+    # 1) Crawl website (merged JSON for entire stream)
     scraped_json = await _call_web_scraper(req.url)
 
     # 2) Prepare website name + filenames
@@ -458,7 +590,7 @@ async def update_website(req: UpdateWebsiteRequest):
       2. If old site exists:
           - Delete JSON from GFAPI
           - Delete site document from Mongo
-      3. Crawl new_url
+      3. Crawl new_url (stream-safe, merged JSON)
       4. Upload new JSON to GFAPI
       5. Insert new site document
     """
@@ -484,7 +616,7 @@ async def update_website(req: UpdateWebsiteRequest):
 
         await _db[SITES_COLLECTION_NAME].delete_one({"_id": old_site["_id"]})
 
-    # Crawl new URL
+    # Crawl new URL (merged JSON)
     scraped_json = await _call_web_scraper(req.new_url)
 
     # Prepare new filename
