@@ -31,6 +31,11 @@ from service_provider import (
     _delete_file_from_gfapi
 )
 
+from service_provider_web import (
+    router as service_provider_web_router,
+    init_service_web_routes
+)
+
 from user import (
     router as user_router,
     init_user_routes
@@ -109,13 +114,14 @@ init_smartsolve_routes(app, db)
 
 # 🔥 Initialize social module (loads model, binds DB, includes router)
 init_social_routes(app, db)
-
+init_service_web_routes(app, db)
 # ---------------------------------------------------------
 # Register Routers
 # ---------------------------------------------------------
 app.include_router(service_router, prefix="/providers", tags=["providers"])
 app.include_router(user_router, prefix="/users", tags=["users"])
 # ❗ DO NOT include social_router again — it is inside init_social_routes()
+app.include_router(service_provider_web_router, prefix="/provider_web", tags=["provider_web"])
 
 # ---------------------------------------------------------
 # Scheduler
