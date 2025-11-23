@@ -101,7 +101,7 @@ def _extract_website_name(url: str) -> str:
 async def _call_web_scraper(url: str) -> Any:
     """
     Call external webscrapper service and return JSON body.
-    GET https://webscrapperr-production.up.railway.app/crawl?url={url}
+    Now supports incorrect content-type, stray whitespace, and BOM.
     """
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -113,31 +113,37 @@ async def _call_web_scraper(url: str) -> Any:
         async with aiohttp.ClientSession() as session:
             async with session.get(full_url, timeout=120) as resp:
                 text = await resp.text()
+
                 if resp.status != 200:
-                    logger.warning("Web scraper HTTP %s: %s", resp.status, text)
                     raise HTTPException(
                         status_code=502,
-                        detail=f"Web scraper failed with status {resp.status}",
+                        detail=f"Web scraper failed with status {resp.status}"
                     )
+
+                # ---- SAFE JSON PARSING ----
                 try:
-                    data = await resp.json()
-                except Exception:
-                    # Try parsing explicitly if resp.json() fails
-                    try:
-                        data = json.loads(text)
-                    except Exception:
-                        raise HTTPException(
-                            status_code=500,
-                            detail="Failed to parse web scraper response as JSON",
-                        )
-                return data
+                    # Try using aiohttp's parser IF content-type is JSON
+                    return await resp.json(content_type=None)
+                except:
+                    pass
+
+                # Manual JSON clean-up
+                cleaned = text.strip().lstrip("\ufeff")
+
+                try:
+                    return json.loads(cleaned)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to parse crawler response as JSON. Raw: " + cleaned
+                    )
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Web scraper call failed: %s", e)
         raise HTTPException(
             status_code=500,
-            detail=f"Error calling web scraper: {e}",
+            detail=f"Error calling web scraper: {e}"
         )
 
 
