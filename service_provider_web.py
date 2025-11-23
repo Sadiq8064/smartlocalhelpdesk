@@ -14,7 +14,7 @@ import uuid
 import logging
 
 # Reuse config + GFAPI helpers from main service_provider module
-from .service_provider import (
+from service_provider import (
     _upload_to_gfapi,
     _delete_file_from_gfapi,
     GKEY,
